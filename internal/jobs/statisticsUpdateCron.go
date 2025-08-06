@@ -78,6 +78,5 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 			app.Logger().Error("Failed to save statistics record", "error", err)
 			return
 		}
-		return
 	}
 }
