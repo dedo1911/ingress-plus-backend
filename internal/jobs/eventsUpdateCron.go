@@ -15,7 +15,7 @@ func getNextOccurrence(cronExpr string) (time.Time, error) {
 		return time.Now(), err
 	}
 	nextExec, err := cronTrigger.NextFireTime(time.Now().UTC().UnixNano())
-	return time.Unix(0, nextExec), nil
+	return time.Unix(0, nextExec), err
 }
 
 func EventsUpdateCron(app *pocketbase.PocketBase) func() {
@@ -30,7 +30,8 @@ func EventsUpdateCron(app *pocketbase.PocketBase) func() {
 			cronString := event.GetString("repeat_cron")
 			nextOccurrence, err := getNextOccurrence(cronString)
 			if err != nil {
-				log.Println(err, "->", cronString)
+				log.Println("Failed to get next occurrence for cron", "cron", cronString, "error", err)
+				app.Logger().Error("Failed to get next occurrence for cron", "cron", cronString, "error", err)
 				continue
 			}
 			nextOccurrence = nextOccurrence.UTC()
@@ -53,12 +54,15 @@ func EventsUpdateCron(app *pocketbase.PocketBase) func() {
 			log.Println("Updating event", event.Id, cronString, "\t", combinedStart, "->", combinedEnd)
 			record, err := app.FindRecordById("game_events", event.Id)
 			if err != nil {
-				log.Println(err)
+				log.Println("Failed to find game_events record", event.Id, ":", err)
+				app.Logger().Error("Failed to find game_events record", "id", event.Id, "error", err)
 				continue
 			}
 			record.Set("start_time", combinedStart)
 			record.Set("end_time", combinedEnd)
 			if err := app.Save(record); err != nil {
+				log.Println("Failed to save game_events record", event.Id, ":", err)
+				app.Logger().Error("Failed to save game_events record", "id", event.Id, "error", err)
 				continue
 			}
 		}
