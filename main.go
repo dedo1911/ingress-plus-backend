@@ -15,8 +15,7 @@ func main() {
 
 	// Register custom routes
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
-		se.Router.POST("/api/mediagress/v1/upload-media", routes.UploadMedia)
-
+		se.Router.POST("/api/mediagress/v2/upload-media", routes.UploadMedia)
 		return se.Next()
 	})
 
