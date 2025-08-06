@@ -21,6 +21,7 @@ func main() {
 
 	// Register the cron job for updating events
 	app.Cron().MustAdd("eventsUpdateCron", "@hourly", jobs.EventsUpdateCron(app))
+	app.Cron().MustAdd("statisticsUpdateCron", "@hourly", jobs.StatisticsUpdateCron(app))
 
 	// Enable JS pb_hooks
 	jsvm.MustRegister(app, jsvm.Config{})
