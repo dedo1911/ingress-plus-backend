@@ -73,6 +73,8 @@ func UploadMedia(e *core.RequestEvent) error {
 	e.App.Logger().DebugContext(e.Request.Context(), "Received upload media request", slog.String("player", data.Player.Nickname))
 
 	newMedias := 0
+	firstTimeUserUploads := 0
+	var newMediaTitles []string
 
 	for _, media := range data.Medias {
 		_, err := e.App.FindFirstRecordByData("medias", "media_id", media.StoryItem.MediaID)
@@ -125,12 +127,13 @@ func UploadMedia(e *core.RequestEvent) error {
 		mediaRecord.Set("uploader_faction", data.Player.Team)
 		mediaRecord.Set("original_data", rawMedia)
 		mediaRecord.Set("level", media.ResourceWithLevels.Level)
-		mediaRecord.Set("approved", false)
+		mediaRecord.Set("approved", true)
 
 		if err := e.App.Save(mediaRecord); err != nil {
 			return newErrorResponse(e, err, http.StatusInternalServerError, "Error saving media record")
 		}
 		newMedias++
+		newMediaTitles = append(newMediaTitles, media.StoryItem.ShortDescription)
 
 		// Check if this user has ever uploaded this media before
 		var mediaUploads struct {
@@ -157,10 +160,14 @@ func UploadMedia(e *core.RequestEvent) error {
 			if err := e.App.Save(uploadRecord); err != nil {
 				return newErrorResponse(e, err, http.StatusInternalServerError, "Error saving media upload record")
 			}
+
+			firstTimeUserUploads++
 		}
 	}
 
 	return e.JSON(http.StatusOK, map[string]any{
 		"previouslyUnknownMediaCount": newMedias,
+		"newMediaTitles":              newMediaTitles,
+		"firstTimeUserUploadCount":    firstTimeUserUploads,
 	})
 }
