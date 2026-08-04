@@ -2,6 +2,7 @@ package routes
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/mail"
@@ -87,9 +88,24 @@ func PreviewAudienceCount(e *core.RequestEvent) error {
 // campaign (normally status "queued"), rather than waiting for the next
 // cron tick. Intended for small audiences the admin panel decides to send
 // instantly instead of queueing.
+//
+// Claims the campaign the same way the cron job does, so a double-click,
+// retry, or an unlucky overlap with the cron job can't send it twice - if
+// something else already claimed it first, this reports a conflict instead
+// of sending again.
 // Route should be registered with apis.RequireSuperuserAuth().
 func DispatchCampaignNow(e *core.RequestEvent) error {
-	campaign, err := e.App.FindRecordById("email_campaigns", e.Request.PathValue("id"))
+	id := e.Request.PathValue("id")
+
+	claimed, err := campaigns.ClaimCampaign(e.App, id)
+	if err != nil {
+		return newErrorResponse(e, err, http.StatusInternalServerError, "Failed to claim campaign")
+	}
+	if !claimed {
+		return newErrorResponse(e, fmt.Errorf("campaign %s is not in queued status", id), http.StatusConflict, "Campaign is already being sent or was already sent")
+	}
+
+	campaign, err := e.App.FindRecordById("email_campaigns", id)
 	if err != nil {
 		return newErrorResponse(e, err, http.StatusNotFound, "Campaign not found")
 	}
