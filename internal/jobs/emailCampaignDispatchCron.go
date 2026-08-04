@@ -33,9 +33,13 @@ func EmailCampaignDispatchCron(app *pocketbase.PocketBase) func() {
 
 			claimed, err := campaigns.ClaimCampaign(app, campaign.Id)
 			if err != nil {
+				// Bail out for this tick rather than continue: the campaign is
+				// still "queued", so continuing would re-query the same record
+				// and spin hot for as long as the DB keeps erroring. The next
+				// tick retries in a few minutes.
 				log.Println("Failed to claim campaign", campaign.Id, err)
 				app.Logger().Error("Failed to claim campaign", "id", campaign.Id, "error", err)
-				continue
+				return
 			}
 			if !claimed {
 				// Another (likely overlapping) tick claimed it first between

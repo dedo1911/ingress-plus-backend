@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 
+	"github.com/dedo1911/ingress-plus-backend/internal/campaigns"
 	"github.com/dedo1911/ingress-plus-backend/internal/jobs"
 	"github.com/dedo1911/ingress-plus-backend/internal/routes"
 	"github.com/pocketbase/pocketbase"
@@ -22,6 +23,10 @@ func main() {
 		se.Router.POST("/api/admin/campaigns/{id}/dispatch", routes.DispatchCampaignNow).Bind(apis.RequireSuperuserAuth())
 		return se.Next()
 	})
+
+	// Block REST updates that would flip an already-sent/sending campaign
+	// back to "queued"/"draft" and cause the cron to re-send it.
+	app.OnRecordUpdateRequest("email_campaigns").BindFunc(campaigns.GuardCampaignUpdateRequest)
 
 	// Register the cron job for updating events
 	app.Cron().MustAdd("eventsUpdateCron", "@hourly", jobs.EventsUpdateCron(app))
