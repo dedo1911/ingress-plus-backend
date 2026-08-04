@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/mailer"
 )
@@ -29,17 +30,41 @@ func recipientPlaceholderValues(recipient *core.Record) map[string]string {
 	}
 }
 
+// ClaimCampaign atomically transitions a campaign from "queued" to
+// "sending", returning claimed=false if it was no longer "queued" by the
+// time this ran. This matters because PocketBase's cron scheduler fires
+// jobs as fire-and-forget goroutines with no protection against overlapping
+// runs (see tools/cron.Cron.runDue) - if a previous tick's dispatch is
+// still working through a large batch when the next tick fires 5 minutes
+// later, both ticks would otherwise see the same not-yet-reached campaign
+// as "queued" and send it twice. A plain record.Set+Save read-then-write
+// isn't atomic, so this uses a single conditional UPDATE instead.
+func ClaimCampaign(app core.App, campaignId string) (bool, error) {
+	result, err := app.DB().
+		NewQuery("UPDATE email_campaigns SET status = 'sending' WHERE id = {:id} AND status = 'queued'").
+		Bind(dbx.Params{"id": campaignId}).
+		Execute()
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 // DispatchCampaign resolves a campaign's audience and sends a personalized
 // email to each recipient. Placeholders are substituted per-recipient, so
 // unlike an identical-content blast this can't be Bcc-batched - each
 // recipient gets their own Send() call. Updates the campaign's
 // status/recipientCount/sentAt/error as it goes.
+//
+// The campaign must already be claimed (status "sending") via
+// ClaimCampaign before calling this - it doesn't claim it itself, so
+// callers can tell "already being handled elsewhere" apart from a real
+// failure.
 func DispatchCampaign(app core.App, campaign *core.Record) error {
-	campaign.Set("status", "sending")
-	if err := app.Save(campaign); err != nil {
-		return fmt.Errorf("failed to mark campaign as sending: %w", err)
-	}
-
 	recipients, err := ResolveAudience(app, campaign.GetString("targeting"))
 	if err != nil {
 		return failCampaign(app, campaign, err)
