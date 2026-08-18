@@ -22,10 +22,22 @@ func RenderPlaceholders(text string, values map[string]string) string {
 	return replacer.Replace(text)
 }
 
+// FormatFaction turns PocketBase's raw lowercase faction value into the
+// capitalized form used in campaign emails, substituting an in-theme
+// placeholder when an agent hasn't set one instead of leaving it blank.
+// Exported so the test-send preview route can build its example values the
+// same way real recipients' are built below.
+func FormatFaction(faction string) string {
+	if faction == "" {
+		return "UNKNOWN FACTION"
+	}
+	return strings.ToUpper(faction[:1]) + faction[1:]
+}
+
 func recipientPlaceholderValues(recipient *core.Record) map[string]string {
 	return map[string]string{
 		"username":  recipient.GetString("username"),
-		"faction":   recipient.GetString("faction"),
+		"faction":   FormatFaction(recipient.GetString("faction")),
 		"userEmail": recipient.GetString("email"),
 	}
 }

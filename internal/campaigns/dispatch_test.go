@@ -12,15 +12,30 @@ import (
 func TestRenderPlaceholders(t *testing.T) {
 	values := map[string]string{
 		"username":  "TestAgent",
-		"faction":   "resistance",
+		"faction":   "Resistance",
 		"userEmail": "agent@example.com",
 	}
 
 	input := "Hi %username%, your faction is %faction% (%userEmail%)."
-	want := "Hi TestAgent, your faction is resistance (agent@example.com)."
+	want := "Hi TestAgent, your faction is Resistance (agent@example.com)."
 
 	if got := campaigns.RenderPlaceholders(input, values); got != want {
 		t.Fatalf("RenderPlaceholders() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatFaction(t *testing.T) {
+	cases := map[string]string{
+		"resistance":  "Resistance",
+		"enlightened": "Enlightened",
+		"machina":     "Machina",
+		"":            "UNKNOWN FACTION",
+	}
+
+	for input, want := range cases {
+		if got := campaigns.FormatFaction(input); got != want {
+			t.Errorf("FormatFaction(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 

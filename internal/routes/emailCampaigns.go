@@ -36,7 +36,7 @@ func SendTestCampaign(e *core.RequestEvent) error {
 
 	values := map[string]string{
 		"username":  "TestAgent",
-		"faction":   "resistance",
+		"faction":   campaigns.FormatFaction("resistance"),
 		"userEmail": e.Auth.Email(),
 	}
 
