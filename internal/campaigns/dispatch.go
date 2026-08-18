@@ -2,13 +2,11 @@ package campaigns
 
 import (
 	"fmt"
-	"net/mail"
 	"strings"
 	"time"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/tools/mailer"
 )
 
 // RenderPlaceholders substitutes the campaign placeholder tokens
@@ -67,15 +65,21 @@ func ClaimCampaign(app core.App, campaignId string) (bool, error) {
 }
 
 // DispatchCampaign resolves a campaign's audience and sends a personalized
-// email to each recipient. Placeholders are substituted per-recipient, so
-// unlike an identical-content blast this can't be Bcc-batched - each
-// recipient gets their own Send() call. Updates the campaign's
+// email to each recipient via Mailjet's bulk Send API (see mailjet.go),
+// batching up to 50 recipients per HTTP call rather than one SMTP
+// connection per recipient. Updates the campaign's
 // status/recipientCount/sentAt/error as it goes.
 //
 // The campaign must already be claimed (status "sending") via
 // ClaimCampaign before calling this - it doesn't claim it itself, so
 // callers can tell "already being handled elsewhere" apart from a real
 // failure.
+//
+// Reuses the existing SMTP credentials as the Mailjet API key/secret -
+// Mailjet's SMTP relay auth *is* the API key (username) and secret key
+// (password), so this needs no new configuration. If SMTP is ever
+// reconfigured to a different provider, this would need its own
+// credentials instead.
 func DispatchCampaign(app core.App, campaign *core.Record) error {
 	recipients, err := ResolveAudience(app, campaign.GetString("targeting"))
 	if err != nil {
@@ -85,14 +89,10 @@ func DispatchCampaign(app core.App, campaign *core.Record) error {
 		return failCampaign(app, campaign, fmt.Errorf("no recipients matched the configured targeting"))
 	}
 
-	mailClient := app.NewMailClient()
-	fromAddress := mail.Address{
-		Name:    app.Settings().Meta.SenderName,
-		Address: app.Settings().Meta.SenderAddress,
-	}
+	smtp := app.Settings().SMTP
+	mailjetClient := &MailjetClient{APIKey: smtp.Username, APISecret: smtp.Password}
 
-	sent := 0
-	failed := 0
+	batch := make([]MailjetRecipient, 0, len(recipients))
 	for _, recipient := range recipients {
 		email := recipient.GetString("email")
 		if email == "" {
@@ -100,20 +100,24 @@ func DispatchCampaign(app core.App, campaign *core.Record) error {
 		}
 
 		values := recipientPlaceholderValues(recipient)
-		message := &mailer.Message{
-			From:    fromAddress,
-			To:      []mail.Address{{Address: email, Name: recipient.GetString("username")}},
+		batch = append(batch, MailjetRecipient{
+			Email:   email,
+			Name:    recipient.GetString("username"),
 			Subject: RenderPlaceholders(campaign.GetString("subject"), values),
 			HTML:    RenderPlaceholders(campaign.GetString("body"), values),
-		}
-
-		if err := mailClient.Send(message); err != nil {
-			app.Logger().Error("Failed to send campaign email", "id", campaign.Id, "recipient", recipient.Id, "error", err)
-			failed++
-			continue
-		}
-		sent++
+		})
 	}
+
+	failed := 0
+	sent := mailjetClient.SendBatches(
+		app.Settings().Meta.SenderAddress,
+		app.Settings().Meta.SenderName,
+		batch,
+		func(recipient MailjetRecipient, reason string) {
+			app.Logger().Error("Failed to send campaign email", "id", campaign.Id, "recipient", recipient.Email, "error", reason)
+			failed++
+		},
+	)
 
 	if sent == 0 {
 		return failCampaign(app, campaign, fmt.Errorf("all %d sends failed", failed))
