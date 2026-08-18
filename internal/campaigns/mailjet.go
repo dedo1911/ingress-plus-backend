@@ -14,6 +14,11 @@ const (
 	mailjetBatchSize  = 50
 	mailjetMaxRetries = 3
 	mailjetRetryDelay = 2 * time.Second
+	// http.DefaultClient has no timeout, so a Mailjet connection that is
+	// accepted and then never answered would hang SendBatches forever,
+	// leaving the campaign stuck in "sending" - a state only a manual
+	// sending->failed->queued round trip can recover from (see guard.go).
+	mailjetTimeout = 30 * time.Second
 )
 
 // MailjetRecipient is one recipient's already-personalized message, built by
@@ -69,7 +74,8 @@ type MailjetClient struct {
 	// at an httptest.Server instead.
 	BaseURL string
 
-	// HTTPClient is overridable for tests; defaults to http.DefaultClient.
+	// HTTPClient is overridable for tests; defaults to a client with a
+	// mailjetTimeout deadline.
 	HTTPClient *http.Client
 
 	// RetryDelay overrides mailjetRetryDelay; used by tests so retry
@@ -95,7 +101,7 @@ func (c *MailjetClient) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return http.DefaultClient
+	return &http.Client{Timeout: mailjetTimeout}
 }
 
 // SendBatches sends the given recipients in batches of up to 50 and returns

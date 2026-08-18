@@ -227,3 +227,47 @@ func TestSendBatches_DoesNotRetryNonRetryableError(t *testing.T) {
 		t.Errorf("made %d attempts, want 1 (a 400 shouldn't be retried)", attempts.Load())
 	}
 }
+
+// TestSendBatches_TimesOutOnHangingServer covers the default HTTP timeout:
+// without one, a server that accepts the connection and then never replies
+// would block SendBatches forever, stranding the campaign in "sending" with
+// only a manual sending->failed->queued recovery (see guard.go). The
+// recipient must instead be reported as failed and the call must return.
+func TestSendBatches_TimesOutOnHangingServer(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // hang until the test is done
+	}))
+	defer server.Close()
+	defer close(release)
+
+	// Override the timeout rather than waiting out the 30s default; the point
+	// under test is that SendBatches gives up at all, not the exact value.
+	client := &campaigns.MailjetClient{
+		APIKey:     "key",
+		APISecret:  "secret",
+		BaseURL:    server.URL,
+		HTTPClient: &http.Client{Timeout: 100 * time.Millisecond},
+		RetryDelay: time.Millisecond,
+	}
+
+	var failures int
+	done := make(chan int, 1)
+	go func() {
+		done <- client.SendBatches("from@example.com", "From", makeRecipients(1), func(campaigns.MailjetRecipient, string) {
+			failures++
+		})
+	}()
+
+	select {
+	case sent := <-done:
+		if sent != 0 {
+			t.Fatalf("expected 0 sent, got %d", sent)
+		}
+		if failures != 1 {
+			t.Fatalf("expected 1 reported failure, got %d", failures)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SendBatches did not return - the request timeout is not being applied")
+	}
+}
