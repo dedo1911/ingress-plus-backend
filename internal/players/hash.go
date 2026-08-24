@@ -12,31 +12,40 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 )
 
 // PepperEnvVar names the environment variable holding the HMAC key.
 const PepperEnvVar = "PLAYER_ID_HASH_PEPPER"
 
-// ErrNotAPlayerID is returned for values that are not real Ingress player IDs:
-// the empty string, and the sentinels moderators write when scrubbing a record
-// on request ("USER DELETED"). Hashing those would be actively harmful - every
-// scrubbed record would collapse onto one shared hash and read as a single
-// prolific agent.
+// ErrNotAPlayerID is returned for anything that is not a well-formed Ingress
+// player ID. Hashing such a value would be actively harmful: every record
+// sharing it would collapse onto one hash and read as a single prolific agent.
 var ErrNotAPlayerID = errors.New("not an Ingress player ID")
 
-// playerIDPattern matches the only shape Ingress has ever sent: 32 lowercase
-// hex characters, a dot, and a short suffix (in practice always "c"), e.g.
-// "cb3773292130450080439d75cdcff215.c". Every one of the 1732 non-scrubbed
-// production records matches it.
+// playerIDPattern matches the only shape Ingress sends: a 32-character hex UUID
+// followed by ".c", e.g. "cb3773292130450080439d75cdcff215.c". Anything else is
+// invalid by definition.
 //
-// This is a format check rather than a denylist of known sentinels on purpose:
-// it also rejects whatever wording a future manual scrub happens to use.
-var playerIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}\.[0-9A-Za-z]+$`)
+// A format check rather than a denylist of known scrub markers on purpose - it
+// also rejects whatever wording a future manual scrub happens to use. Verified
+// against the full production table: of 1734 stored values, 1732 match this
+// exactly (all lowercase, all ".c", no exceptions) and the only two that do not
+// are "" and "USER DELETED". A further 20 records carry no playerId key at all.
+var playerIDPattern = regexp.MustCompile(`^[0-9a-f]{32}\.c$`)
 
-// IsPlayerID reports whether raw looks like a real Ingress player ID rather
-// than a blank or a moderator's scrub marker.
+// normalize lowercases raw so that the same ID written in different cases can
+// never hash to two values and split one agent into two identities. Everything
+// in production is already lowercase; this just makes that guarantee explicit
+// rather than incidental.
+func normalize(raw string) string {
+	return strings.ToLower(raw)
+}
+
+// IsPlayerID reports whether raw is a well-formed Ingress player ID rather than
+// a blank, a moderator's scrub marker, or anything else malformed.
 func IsPlayerID(raw string) bool {
-	return playerIDPattern.MatchString(raw)
+	return playerIDPattern.MatchString(normalize(raw))
 }
 
 // Hasher derives the stored identifier for a player ID.
@@ -78,11 +87,12 @@ func NewHasherFromEnv() (*Hasher, error) {
 // a real player ID. The same input always yields the same output, which is what
 // lets separate uploads from one agent be grouped together.
 func (h *Hasher) Hash(raw string) (string, error) {
-	if !IsPlayerID(raw) {
+	normalized := normalize(raw)
+	if !playerIDPattern.MatchString(normalized) {
 		return "", fmt.Errorf("%q: %w", raw, ErrNotAPlayerID)
 	}
 
 	mac := hmac.New(sha256.New, h.pepper)
-	mac.Write([]byte(raw))
+	mac.Write([]byte(normalized))
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }

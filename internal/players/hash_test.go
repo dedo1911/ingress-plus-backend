@@ -2,6 +2,7 @@ package players_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/dedo1911/ingress-plus-backend/internal/players"
@@ -16,7 +17,7 @@ func TestIsPlayerID(t *testing.T) {
 	}{
 		{samplePlayerID, true},
 		{"bdad80740e154097ab7aa238da864c03.c", true},
-		{"CB3773292130450080439D75CDCFF215.c", true}, // case-insensitive hex
+		{"CB3773292130450080439D75CDCFF215.c", true}, // same UUID, normalized
 
 		// the values moderators leave behind when scrubbing a record, which
 		// must never be hashed - see ErrNotAPlayerID
@@ -24,11 +25,16 @@ func TestIsPlayerID(t *testing.T) {
 		{"USER DELETED", false},
 		{"UNKNOWN", false},
 
-		// near-misses
-		{"cb3773292130450080439d75cdcff215", false},   // no suffix
-		{"cb3773292130450080439d75cdcff21.c", false},  // 31 hex chars
-		{"cb3773292130450080439d75cdcff215.", false},  // empty suffix
-		{"zb3773292130450080439d75cdcff215.c", false}, // not hex
+		// near-misses: a player ID is 32 hex characters plus ".c", and anything
+		// that does not follow that exactly is invalid
+		{"cb3773292130450080439d75cdcff215", false},    // no suffix
+		{"cb3773292130450080439d75cdcff21.c", false},   // 31 hex chars
+		{"cb3773292130450080439d75cdcff2155.c", false}, // 33 hex chars
+		{"cb3773292130450080439d75cdcff215.", false},   // empty suffix
+		{"cb3773292130450080439d75cdcff215.d", false},  // wrong suffix
+		{"cb3773292130450080439d75cdcff215.cc", false}, // suffix too long
+		{"zb3773292130450080439d75cdcff215.c", false},  // not hex
+		{" cb3773292130450080439d75cdcff215.c", false}, // stray whitespace
 	}
 
 	for _, s := range scenarios {
@@ -63,6 +69,28 @@ func TestHashIsStable(t *testing.T) {
 	}
 	if first == samplePlayerID {
 		t.Fatal("hash returned the raw player ID")
+	}
+}
+
+// An agent must not be split into two identities by a difference in casing, so
+// a player ID that differs only in case has to hash to the same value.
+func TestHashIsCaseInsensitive(t *testing.T) {
+	hasher, err := players.NewHasher("test-pepper")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lower, err := hasher.Hash(samplePlayerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper, err := hasher.Hash(strings.ToUpper(samplePlayerID[:32]) + ".c")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if lower != upper {
+		t.Fatalf("the same player ID in different cases produced two identities: %q vs %q", lower, upper)
 	}
 }
 
@@ -107,8 +135,10 @@ func TestHashRejectsScrubbedValues(t *testing.T) {
 	}
 
 	// Hashing these would collapse every scrubbed record onto one shared hash,
-	// which would then read as a single extremely prolific agent.
-	for _, raw := range []string{"", "USER DELETED"} {
+	// which would then read as a single extremely prolific agent. "" and
+	// "USER DELETED" are the only two non-conforming values in the production
+	// table today; the rest are guards against future malformed input.
+	for _, raw := range []string{"", "USER DELETED", "UNKNOWN", "cb3773292130450080439d75cdcff215.d", "not-an-id"} {
 		if _, err := hasher.Hash(raw); !errors.Is(err, players.ErrNotAPlayerID) {
 			t.Errorf("Hash(%q) error = %v, want ErrNotAPlayerID", raw, err)
 		}

@@ -246,14 +246,20 @@ func linkByIgn(app core.App, collection string, ignToRecordID map[string]string)
 	return total, nil
 }
 
-// stripPlayerIDs removes the raw ID from every record that has one, trusted or
-// not - the privacy fix applies to all of them, including the legacy import
-// whose IDs are real even though its attribution is not.
+// stripPlayerIDs removes the raw ID from every record that has a real one,
+// trusted or not - the privacy fix applies to all of them, including the legacy
+// import whose IDs are real even though its attribution is not.
+//
+// Records whose playerId is not a well-formed ID are left exactly as they are.
+// Those are deliberate moderator scrubs (currently one "USER DELETED" and one
+// empty string): there is nothing left in them to protect, and overwriting the
+// marker would erase the evidence that the removal was intentional rather than
+// data that never had a player ID in the first place.
 func stripPlayerIDs(app core.App, rows []mediaRow) (int, error) {
 	stripped := 0
 
 	for _, row := range rows {
-		if rawPlayerID(row.OriginalData) == "" {
+		if !players.IsPlayerID(rawPlayerID(row.OriginalData)) {
 			continue
 		}
 

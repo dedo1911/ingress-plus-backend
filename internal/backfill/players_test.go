@@ -1,9 +1,12 @@
 package backfill
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dedo1911/ingress-plus-backend/internal/players"
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tests"
 )
 
 const (
@@ -151,5 +154,78 @@ func TestBuildMappingsCountsRecordsForTrustThreshold(t *testing.T) {
 	}
 	if counts["occasional"] >= minRecordsToTrustMapping {
 		t.Fatalf("occasional agent should fall below the trust threshold, counted %d", counts["occasional"])
+	}
+}
+
+// TestStripPlayerIDsLeavesScrubMarkersAlone checks that the privacy pass
+// rewrites records holding a real player ID and nothing else. A moderator's
+// scrub marker is evidence that a removal was deliberate, and overwriting it
+// would make that indistinguishable from a record that never had an ID.
+func TestStripPlayerIDsLeavesScrubMarkersAlone(t *testing.T) {
+	app, err := tests.NewTestApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Cleanup()
+
+	medias := core.NewBaseCollection("medias")
+	medias.Fields.Add(&core.JSONField{Name: "original_data", MaxSize: 2000000})
+	if err := app.Save(medias); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		payload string
+		changed bool
+	}{
+		{"real player ID", payload(playerA), true},
+		{"scrubbed to a marker", payload("USER DELETED"), false},
+		{"scrubbed to empty", payload(""), false},
+	}
+
+	var rows []mediaRow
+	ids := map[string]string{}
+	for _, c := range cases {
+		record := core.NewRecord(medias)
+		record.Set("original_data", c.payload)
+		if err := app.Save(record); err != nil {
+			t.Fatal(err)
+		}
+		ids[c.name] = record.Id
+		rows = append(rows, mediaRow{ID: record.Id, OriginalData: c.payload})
+	}
+
+	stripped, err := stripPlayerIDs(app, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stripped != 1 {
+		t.Fatalf("stripped = %d, want 1 (only the record with a real player ID)", stripped)
+	}
+
+	for _, c := range cases {
+		record, err := app.FindRecordById("medias", ids[c.name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored := record.GetString("original_data")
+
+		if c.changed {
+			if strings.Contains(stored, playerA) {
+				t.Errorf("%s: raw player ID survived: %s", c.name, stored)
+			}
+			if strings.Contains(stored, "playerId") {
+				t.Errorf("%s: playerId key survived: %s", c.name, stored)
+			}
+			if !strings.Contains(stored, "acquisitionTimestampMs") {
+				t.Errorf("%s: stripping removed more than the player ID: %s", c.name, stored)
+			}
+			continue
+		}
+
+		if rawPlayerID(stored) != rawPlayerID(c.payload) {
+			t.Errorf("%s: marker was modified, got %s", c.name, stored)
+		}
 	}
 }

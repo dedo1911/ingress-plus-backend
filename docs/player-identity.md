@@ -94,6 +94,32 @@ A username that resolves to more than one player is dropped rather than guessed
 at. Renames are the mirror image and are kept: one player legitimately appears
 under several usernames, each of which was theirs alone.
 
-The raw player ID is stripped from **every** record regardless of whether it
-could be attributed — the legacy IDs are real people's IDs even where the
-attribution around them is not.
+The raw player ID is stripped from every record that holds a **real** one,
+regardless of whether it could be attributed — the legacy IDs are real people's
+IDs even where the attribution around them is not.
+
+## What counts as a player ID
+
+A player ID is a 32-character lowercase hex UUID followed by `.c`, e.g.
+`cb3773292130450080439d75cdcff215.c`. Anything else is invalid and is never
+hashed: hashing a shared non-ID value would collapse every record carrying it
+onto one hash, which would then read as a single extremely prolific agent.
+
+Validation is a format check, not a list of known scrub markers, so it also
+rejects whatever wording a future manual scrub happens to use. Verified against
+the full table as of 2026-08-24:
+
+| | Count |
+| --- | --- |
+| Well-formed IDs (all lowercase, all `.c`, no exceptions) | 1732 |
+| No `playerId` key at all (13 `kidobarrett`, 7 `NaiRoH`) | 20 |
+| `playerId: ""` | 1 |
+| `playerId: "USER DELETED"` | 1 |
+
+Records whose `playerId` is not well-formed are left **completely untouched** by
+the backfill. There is nothing in them left to protect, and overwriting a
+moderator's marker would erase the evidence that the removal was deliberate
+rather than data that never carried an ID.
+
+IDs are lowercased before hashing so that the same UUID in different cases can
+never fork into two identities.
