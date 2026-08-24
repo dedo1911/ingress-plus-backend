@@ -113,7 +113,7 @@ func TestEnsureMediaCreatesOnceAndStripsPlayerID(t *testing.T) {
 	media := testMedia("5332")
 	player := testPlayer("oscarc1")
 
-	urlID, created, err := ensureMedia(app, media, "", player)
+	urlID, created, err := ensureMedia(app, media, "", player, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestEnsureMediaCreatesOnceAndStripsPlayerID(t *testing.T) {
 	}
 
 	// a second upload of the same Media must not create another record
-	sameURLID, created, err := ensureMedia(app, media, "", testPlayer("someoneelse"))
+	sameURLID, created, err := ensureMedia(app, media, "", testPlayer("someoneelse"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,5 +262,33 @@ func TestEnsurePlayerIsIdempotentAndTracksRenames(t *testing.T) {
 	}
 	if len(all) != 1 {
 		t.Fatalf("expected exactly 1 players record, got %d", len(all))
+	}
+}
+
+// TestEnsureMediaHonoursApprovalPerVersion pins the one behaviour that still
+// legitimately differs between the endpoints: v1 queues a newly discovered
+// Media for manual review, v2 publishes it straight away. Both now share the
+// same code path, so this is what keeps the frozen v1 semantics from drifting.
+func TestEnsureMediaHonoursApprovalPerVersion(t *testing.T) {
+	app := newTestApp(t)
+
+	if _, _, err := ensureMedia(app, testMedia("1001"), "", testPlayer("v1agent"), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ensureMedia(app, testMedia("1002"), "", testPlayer("v2agent"), true); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		mediaID string
+		want    bool
+	}{{"1001", false}, {"1002", true}} {
+		record, err := app.FindFirstRecordByData("medias", "media_id", c.mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := record.GetBool("approved"); got != c.want {
+			t.Errorf("media %s approved = %v, want %v", c.mediaID, got, c.want)
+		}
 	}
 }

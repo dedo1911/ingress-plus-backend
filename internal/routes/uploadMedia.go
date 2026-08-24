@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/dedo1911/ingress-plus-backend/internal/notify"
 	"github.com/dedo1911/ingress-plus-backend/internal/players"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
@@ -63,7 +64,52 @@ type UploadMediaRequest struct {
 	Medias []Media `json:"medias"`
 }
 
-// UploadMedia handles an upload from the Mediagress IITC plugin.
+// uploadMediaOptions carries the deliberate behaviour differences between
+// the two versions of the endpoint. v1 is frozen: it has to keep matching
+// what pb_hooks/mediagress.pb.js did, because clients too old to be
+// updated still call it.
+//
+// Note that per-agent upload tracking is *not* one of the differences. It
+// used to be - v2 recorded a media_uploads row only for media it had just
+// created - but that was a defect rather than a decision: media_uploads is
+// the log of every agent's upload of every Media, so skipping the
+// already-known ones silently dropped most contributions. See uploadMedia.
+type uploadMediaOptions struct {
+	// approveNewMedia is the "approved" value for freshly created media
+	// records: v1 queues them for manual review, v2 publishes them
+	// straight away.
+	approveNewMedia bool
+
+	// legacyResponse returns the single-field v1 response body instead of
+	// the richer v2 one, since old clients parse it strictly.
+	legacyResponse bool
+
+	telegram *notify.Telegram
+	hasher   *players.Hasher
+}
+
+// UploadMediaV1 handles POST /api/mediagress/v1/upload-media, the legacy
+// endpoint kept alive for clients that were never updated to v2.
+func UploadMediaV1(telegram *notify.Telegram, hasher *players.Hasher) func(*core.RequestEvent) error {
+	return uploadMedia(uploadMediaOptions{
+		approveNewMedia: false,
+		legacyResponse:  true,
+		telegram:        telegram,
+		hasher:          hasher,
+	})
+}
+
+// UploadMediaV2 handles POST /api/mediagress/v2/upload-media.
+func UploadMediaV2(telegram *notify.Telegram, hasher *players.Hasher) func(*core.RequestEvent) error {
+	return uploadMedia(uploadMediaOptions{
+		approveNewMedia: true,
+		legacyResponse:  false,
+		telegram:        telegram,
+		hasher:          hasher,
+	})
+}
+
+// uploadMedia handles an upload from the Mediagress IITC plugin.
 //
 // Two collections are written, and the difference between them matters:
 //   - "medias" holds one record per Media that exists in the game, created by
@@ -72,16 +118,17 @@ type UploadMediaRequest struct {
 //     what the site's contribution stats and "my uploads" are built from.
 //
 // Every upload therefore produces a media_uploads row whether or not the Media
-// itself was already known. Until this change the handler skipped already-known
-// Media outright, so repeat uploads went unrecorded and firstTimeUserUploadCount
-// could never differ from previouslyUnknownMediaCount - the "already on
-// Mediagress but new to you" case it was added for was unreachable.
+// itself was already known. v2 used to skip already-known media outright, so
+// repeat uploads went unrecorded and firstTimeUserUploadCount could never
+// differ from previouslyUnknownMediaCount - the "already on Mediagress but new
+// to you" case it was added for was unreachable, because the count it tested
+// was keyed on a url_id minted one line earlier.
 //
 // The route is unauthenticated: the plugin runs on intel.ingress.com with no
 // Ingress Plus session, so nickname and faction are self-asserted. Treat them
 // as display data - the hashed player ID is the identity, and only the
 // verification flow makes it trustworthy.
-func UploadMedia(hasher *players.Hasher) func(*core.RequestEvent) error {
+func uploadMedia(opts uploadMediaOptions) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		defer e.Request.Body.Close()
 		body, err := io.ReadAll(e.Request.Body)
@@ -95,20 +142,26 @@ func UploadMedia(hasher *players.Hasher) func(*core.RequestEvent) error {
 
 		e.App.Logger().DebugContext(e.Request.Context(), "Received upload media request", slog.String("player", data.Player.Nickname))
 
-		playerRecordID := resolvePlayer(e, hasher, data)
+		playerRecordID := resolvePlayer(e, opts.hasher, data)
 
 		newMedias := 0
 		firstTimeUserUploads := 0
 		var newMediaTitles []string
 
 		for _, media := range data.Medias {
-			urlID, created, err := ensureMedia(e.App, media, playerRecordID, data.Player)
+			urlID, created, err := ensureMedia(e.App, media, playerRecordID, data.Player, opts.approveNewMedia)
 			if err != nil {
 				return newErrorResponse(e, err, http.StatusInternalServerError, "Error saving media record")
 			}
 			if created {
 				newMedias++
 				newMediaTitles = append(newMediaTitles, media.StoryItem.ShortDescription)
+
+				opts.telegram.SendAsync(
+					e.App.Logger(),
+					opts.telegram.Topics.Media,
+					notify.MediaMessage(media.StoryItem.ShortDescription, media.StoryItem.MediaID, data.Player.Nickname),
+				)
 			}
 
 			firstTime, err := ensureUpload(e.App, urlID, playerRecordID, data.Player)
@@ -118,6 +171,12 @@ func UploadMedia(hasher *players.Hasher) func(*core.RequestEvent) error {
 			if firstTime {
 				firstTimeUserUploads++
 			}
+		}
+
+		if opts.legacyResponse {
+			return e.JSON(http.StatusOK, map[string]any{
+				"previouslyUnknownMediaCount": newMedias,
+			})
 		}
 
 		return e.JSON(http.StatusOK, map[string]any{
@@ -175,7 +234,7 @@ func stripPlayerID(media Media) Media {
 // ensureMedia returns the url_id of the "medias" record for this Media,
 // creating it if this is the first time anyone has uploaded it. The bool
 // reports whether it was created.
-func ensureMedia(app core.App, media Media, playerRecordID string, player Player) (int, bool, error) {
+func ensureMedia(app core.App, media Media, playerRecordID string, player Player, approved bool) (int, bool, error) {
 	existing, err := app.FindFirstRecordByData("medias", "media_id", media.StoryItem.MediaID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, false, err
@@ -226,7 +285,7 @@ func ensureMedia(app core.App, media Media, playerRecordID string, player Player
 		record.Set("uploader_faction", player.Team)
 		record.Set("original_data", rawMedia)
 		record.Set("level", media.ResourceWithLevels.Level)
-		record.Set("approved", true)
+		record.Set("approved", approved)
 		if playerRecordID != "" {
 			record.Set("player", playerRecordID)
 		}
