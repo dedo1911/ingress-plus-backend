@@ -18,6 +18,11 @@ const CollectionName = "players"
 // is the current one. It exists only so the admin panel has something readable
 // to match a COMM message against - the hash stays the identity.
 //
+// An empty ign or faction leaves whatever is already stored alone. The backfill
+// creates records for player IDs it deliberately refuses to attribute and has
+// no trustworthy nickname to offer for them; that must not erase a nickname
+// another record already proved.
+//
 // Creation races on the unique player_hash index (two uploads from the same
 // agent arriving together) are resolved by re-reading rather than failing: by
 // then the other writer has created exactly the record we wanted.
@@ -48,12 +53,24 @@ func Ensure(app core.App, hash, ign, faction string) (*core.Record, error) {
 		return record, nil
 	}
 
-	if record.GetString("last_ign") == ign && record.GetString("last_faction") == faction {
+	currentIgn := record.GetString("last_ign")
+	currentFaction := record.GetString("last_faction")
+
+	newIgn := currentIgn
+	if ign != "" {
+		newIgn = ign
+	}
+	newFaction := currentFaction
+	if faction != "" {
+		newFaction = faction
+	}
+
+	if newIgn == currentIgn && newFaction == currentFaction {
 		return record, nil
 	}
 
-	record.Set("last_ign", ign)
-	record.Set("last_faction", faction)
+	record.Set("last_ign", newIgn)
+	record.Set("last_faction", newFaction)
 	if err := app.Save(record); err != nil {
 		return nil, err
 	}

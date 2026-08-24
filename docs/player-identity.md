@@ -66,13 +66,15 @@ records.
        ./ingress-plus backfill-player-hashes --dry-run
 
    Against production data as of 2026-08-24 this reports 1754 medias scanned,
-   22 scrubbed or without a player ID, and 33 trusted username mappings — 16
-   above the trust threshold and 17 listed for manual assignment.
+   22 scrubbed or without a player ID, 81 distinct player IDs, and 33 trusted
+   username mappings — 16 above the trust threshold and 17 listed for manual
+   assignment.
 4. Run it for real:
 
        ./ingress-plus backfill-player-hashes
 
 5. Assign the 17 sub-threshold usernames by hand, using the printed report.
+   The 48 unattributed records need nothing: they fill themselves in.
 6. Once verified, drop the now-redundant `media_uploads.agent_guid_hashed`
    column — it was added for this purpose but never populated.
 
@@ -98,6 +100,23 @@ table never stored a player ID.
 A username that resolves to more than one player is dropped rather than guessed
 at. Renames are the mirror image and are kept: one player legitimately appears
 under several usernames, each of which was theirs alone.
+
+## Hashes without an owner
+
+A `players` record is created for **every** player ID in the table — 81 of them
+— not just the 33 that could be tied to a username. The other 48 appear only in
+the legacy import, so there is no honest way to say whose uploads they are, and
+they are created bare: no `last_ign`, no relations, nothing claimed.
+
+They are kept because the hash is stable. If one of those agents ever uploads
+again, the live path hashes their player ID, finds the record already sitting
+there, and fills in the nickname — at which point an admin can link their
+history. Throwing the hash away at backfill time would forfeit that for nothing,
+since the raw ID is being stripped either way.
+
+This is why `players.Ensure` treats an empty nickname as "leave what's there
+alone" rather than as a value to write: the backfill passes one for all 48, and
+it must not erase a nickname a trusted record already proved.
 
 The raw player ID is stripped from every record that holds a **real** one,
 regardless of whether it could be attributed — the legacy IDs are real people's

@@ -44,9 +44,9 @@ type mapping struct {
 // NewCommand builds the "backfill-player-hashes" CLI command.
 //
 // It does three things, in order: derive a trustworthy username -> player-hash
-// map from the plugin-era records, create the players records and attach them
-// to medias/media_uploads by username, and strip every raw player ID out of
-// original_data.
+// map from the plugin-era records, create a players record for every player ID
+// in the table and attach the trusted ones to medias/media_uploads by username,
+// and strip every raw player ID out of original_data.
 //
 // Attribution is applied by username rather than from each record's own
 // original_data. That sounds indirect but is the only correct option: an
@@ -87,6 +87,7 @@ func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) 
 	}
 
 	trusted, skipped := buildMappings(rows, hasher)
+	hashes := collectHashes(rows, hasher)
 
 	auto := map[string]mapping{}
 	var review []mapping
@@ -100,6 +101,7 @@ func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) 
 
 	cmd.Printf("medias scanned:            %d\n", len(rows))
 	cmd.Printf("scrubbed / no player ID:   %d\n", skipped)
+	cmd.Printf("distinct player IDs:       %d\n", len(hashes))
 	cmd.Printf("trusted username mappings: %d (%d auto-assignable, %d for manual review)\n",
 		len(trusted), len(auto), len(review))
 
@@ -116,19 +118,31 @@ func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) 
 		return nil
 	}
 
-	// Every mapping gets a players record, including the sub-threshold ones, so
-	// an admin confirming one later only has to set its user relation.
-	ignToRecordID := map[string]string{}
+	// Every distinct player ID gets a players record - the trusted mappings
+	// carry their nickname, the rest are created bare and stay unlinked.
+	hashToIgn := map[string]string{}
 	for _, m := range trusted {
-		record, err := players.Ensure(app, m.hash, m.ign, "")
-		if err != nil {
-			return fmt.Errorf("creating player record for %s: %w", m.ign, err)
-		}
-		if _, ok := auto[m.ign]; ok {
-			ignToRecordID[m.ign] = record.Id
-		}
+		hashToIgn[m.hash] = m.ign
 	}
-	cmd.Printf("\nplayers records ensured:   %d\n", len(trusted))
+
+	hashToRecordID := map[string]string{}
+	for _, hash := range hashes {
+		record, err := players.Ensure(app, hash, hashToIgn[hash], "")
+		if err != nil {
+			return fmt.Errorf("creating player record for %s: %w", hash[:16], err)
+		}
+		hashToRecordID[hash] = record.Id
+	}
+
+	// Only mappings above the trust threshold are attached to records;
+	// everything else waits for a human.
+	ignToRecordID := map[string]string{}
+	for _, m := range auto {
+		ignToRecordID[m.ign] = hashToRecordID[m.hash]
+	}
+
+	cmd.Printf("\nplayers records ensured:   %d (%d identified, %d unattributed)\n",
+		len(hashToRecordID), len(trusted), len(hashToRecordID)-len(trusted))
 
 	mediasLinked, err := linkByIgn(app, "medias", ignToRecordID)
 	if err != nil {
@@ -206,6 +220,35 @@ func buildMappings(rows []mediaRow, hasher *players.Hasher) ([]mapping, int) {
 	sort.Slice(out, func(i, j int) bool { return out[i].ign < out[j].ign })
 
 	return out, skipped
+}
+
+// collectHashes returns every distinct player hash appearing anywhere in the
+// table, legacy import included, sorted so a run is deterministic.
+//
+// Deliberately wider than buildMappings. A player ID that only the
+// untrustworthy legacy import mentions cannot be attributed to anyone, but it
+// is still a real account and the hash is stable: if that agent ever uploads
+// again the live path derives the same hash and lands on the same record, at
+// which point their history can be linked up. Discarding it at backfill time
+// would throw that future away for nothing, since the raw ID is being stripped
+// either way.
+func collectHashes(rows []mediaRow, hasher *players.Hasher) []string {
+	seen := map[string]bool{}
+	for _, row := range rows {
+		hash, err := hasher.Hash(rawPlayerID(row.OriginalData))
+		if err != nil {
+			continue
+		}
+		seen[hash] = true
+	}
+
+	out := make([]string, 0, len(seen))
+	for hash := range seen {
+		out = append(out, hash)
+	}
+	sort.Strings(out)
+
+	return out
 }
 
 // rawPlayerID digs the player ID out of a stored original_data blob. Anything

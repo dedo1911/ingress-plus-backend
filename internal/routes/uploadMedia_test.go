@@ -292,3 +292,70 @@ func TestEnsureMediaHonoursApprovalPerVersion(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureKeepsKnownNicknameWhenGivenNone protects the backfill, which
+// creates records for player IDs it deliberately refuses to attribute and has
+// no trustworthy nickname to offer for them. Passing an empty nickname must
+// leave a known one alone rather than wipe it.
+func TestEnsureKeepsKnownNicknameWhenGivenNone(t *testing.T) {
+	app := newTestApp(t)
+
+	hasher, err := players.NewHasher("test-pepper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hasher.Hash(testPlayerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := players.Ensure(app, hash, "oscarc1", "RESISTANCE"); err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := players.Ensure(app, hash, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := record.GetString("last_ign"); got != "oscarc1" {
+		t.Fatalf("last_ign = %q, want the known nickname to survive", got)
+	}
+	if got := record.GetString("last_faction"); got != "RESISTANCE" {
+		t.Fatalf("last_faction = %q, want the known faction to survive", got)
+	}
+}
+
+// The mirror case: a record created bare by the backfill picks up a nickname
+// the first time its owner uploads again. That is the whole point of keeping
+// the unattributed hashes.
+func TestEnsureFillsInNicknameOnLaterUpload(t *testing.T) {
+	app := newTestApp(t)
+
+	hasher, err := players.NewHasher("test-pepper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hasher.Hash(testPlayerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bare, err := players.Ensure(app, hash, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bare.GetString("last_ign"); got != "" {
+		t.Fatalf("expected a bare record, got last_ign %q", got)
+	}
+
+	filled, err := players.Ensure(app, hash, "oscarc1", "RESISTANCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled.Id != bare.Id {
+		t.Fatal("a later upload created a second record instead of reusing the hashed one")
+	}
+	if got := filled.GetString("last_ign"); got != "oscarc1" {
+		t.Fatalf("last_ign = %q, want it filled in from the upload", got)
+	}
+}
