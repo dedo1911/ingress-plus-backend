@@ -107,10 +107,11 @@ Delete the seven records in the right-hand column, then add the indexes.
 
 ## 4. Rollout order
 
-Both upload endpoints hash. v1 is the legacy route ported out of `pb_hooks` and
-still serves clients that were never updated to v2 — it was carrying most of the
-traffic — so leaving it unhashed would have kept writing raw player IDs into new
-records.
+Ship this in two releases. Hashing goes out first with **v1 still live and
+hashing** — it was carrying most of the upload traffic, so leaving it unhashed
+would have kept writing raw player IDs into new records, and retiring it in the
+same release would silence most uploads at the exact moment the backfill needs
+checking. v1's retirement is step 8, on its own.
 
 1. Apply the schema above and set the pepper.
 2. Deploy. New uploads on **both v1 and v2** are hashed and attributed from this
@@ -133,6 +134,10 @@ records.
    It has to come after the backfill - see above.
 7. Once verified, drop `media_uploads.agent_guid_hashed`. It was added for this
    purpose and never populated; the `player` relation supersedes it.
+8. Retiring v1 is a **separate deploy**. Doing it in the same release as the
+   hashing would break every out-of-date plugin at the same moment the backfill
+   runs, and those are two unrelated things to debug at once. Ship hashing,
+   confirm the backfill, then ship the retirement.
 
 The backfill is idempotent and can be re-run.
 

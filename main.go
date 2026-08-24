@@ -29,10 +29,11 @@ func main() {
 
 	// Register custom routes
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
-		// v1 is the legacy endpoint that used to be served by
-		// pb_hooks/mediagress.pb.js, kept for clients that were never
-		// updated to v2 (see routes.UploadMediaV1 for the differences).
-		se.Router.POST("/api/mediagress/v1/upload-media", routes.UploadMediaV1(telegram, hasher))
+		// v1 is retired. The route stays registered only so agents on an
+		// out-of-date plugin get told why their uploads stopped working
+		// instead of a bare 404 - remove it once they have had time to
+		// update. See routes.UploadMediaV1.
+		se.Router.POST("/api/mediagress/v1/upload-media", routes.UploadMediaV1())
 		se.Router.POST("/api/mediagress/v2/upload-media", routes.UploadMediaV2(telegram, hasher))
 		se.Router.POST("/api/admin/campaigns/send-test", routes.SendTestCampaign).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/preview-count", routes.PreviewAudienceCount).Bind(apis.RequireSuperuserAuth())
