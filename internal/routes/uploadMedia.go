@@ -243,6 +243,18 @@ func ensureMedia(app core.App, media Media, playerRecordID string, player Player
 		return existing.GetInt("url_id"), false, nil
 	}
 
+	return createMedia(app, media, playerRecordID, player, approved)
+}
+
+// createMedia inserts a newly discovered Media and returns its freshly minted
+// url_id, or resolves to the existing record if another upload created it first.
+//
+// Split out from ensureMedia's existence check on purpose: that check runs
+// outside the transaction, so two uploads of the same new Media can both pass
+// it. The unique index on media_id is what actually enforces uniqueness - this
+// exists to turn its rejection into the right answer rather than a 500, and to
+// make that recovery testable without having to win a race.
+func createMedia(app core.App, media Media, playerRecordID string, player Player, approved bool) (int, bool, error) {
 	ms, err := strconv.ParseInt(media.StoryItem.ReleaseDate, 10, 64)
 	if err != nil {
 		return 0, false, fmt.Errorf("parsing release date %q: %w", media.StoryItem.ReleaseDate, err)
@@ -293,6 +305,13 @@ func ensureMedia(app core.App, media Media, playerRecordID string, player Player
 		return txApp.Save(record)
 	})
 	if err != nil {
+		// Rejected by a unique index because another upload created this Media
+		// first. Not an error for this request - the Media exists, it just
+		// wasn't this agent who discovered it - so re-read and carry on to log
+		// their upload.
+		if existing, findErr := app.FindFirstRecordByData("medias", "media_id", media.StoryItem.MediaID); findErr == nil && existing != nil {
+			return existing.GetInt("url_id"), false, nil
+		}
 		return 0, false, err
 	}
 

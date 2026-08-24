@@ -3,6 +3,7 @@ package routes
 import (
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dedo1911/ingress-plus-backend/internal/players"
@@ -47,6 +48,11 @@ func newTestApp(t *testing.T) *tests.TestApp {
 	medias.Fields.Add(&core.NumberField{Name: "level"})
 	medias.Fields.Add(&core.BoolField{Name: "approved"})
 	medias.Fields.Add(&core.RelationField{Name: "player", CollectionId: playersCollection.Id, MaxSelect: 1})
+	// Both unique in production: media_id is the natural key (Niantic's id) and
+	// url_id is the public identifier in /media/<url_id>. They are what actually
+	// stops two concurrent uploads of the same new Media creating two records.
+	medias.AddIndex("idx_medias_media_id", true, "media_id", "")
+	medias.AddIndex("idx_medias_url_id", true, "url_id", "")
 	if err := app.Save(medias); err != nil {
 		t.Fatalf("creating medias collection: %v", err)
 	}
@@ -357,5 +363,104 @@ func TestEnsureFillsInNicknameOnLaterUpload(t *testing.T) {
 	}
 	if got := filled.GetString("last_ign"); got != "oscarc1" {
 		t.Fatalf("last_ign = %q, want it filled in from the upload", got)
+	}
+}
+
+// TestEnsureMediaConcurrentDiscovery reproduces the incident that made the
+// unique index impossible to add: several uploads of the same new Media
+// arriving together all passed the existence check, because it runs outside the
+// transaction, and each inserted its own record. Production ended up with 7
+// duplicated media_ids, 2 of which also shared a url_id.
+//
+// Exactly one caller must create the Media; the rest must quietly agree it
+// already exists and report the same url_id, so their upload is still logged.
+func TestEnsureMediaConcurrentDiscovery(t *testing.T) {
+	app := newTestApp(t)
+	media := testMedia("4962")
+
+	const callers = 6
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	created := 0
+	urlIDs := map[int]bool{}
+	var failures []error
+
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			urlID, wasCreated, err := ensureMedia(app, media, "", testPlayer("hisname"), true)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failures = append(failures, err)
+				return
+			}
+			if wasCreated {
+				created++
+			}
+			urlIDs[urlID] = true
+		}()
+	}
+	wg.Wait()
+
+	for _, err := range failures {
+		t.Errorf("a concurrent caller failed instead of recovering: %v", err)
+	}
+	if created != 1 {
+		t.Errorf("created = %d, want exactly 1 discoverer", created)
+	}
+	if len(urlIDs) != 1 {
+		t.Errorf("callers saw %d different url_ids, want 1: %v", len(urlIDs), urlIDs)
+	}
+
+	records, err := app.FindAllRecords("medias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 medias record, got %d", len(records))
+	}
+}
+
+// TestCreateMediaRecoversFromLostRace drives the recovery path directly by
+// calling createMedia for a media_id that already exists - exactly the state a
+// caller lands in when another upload wins the race between ensureMedia's
+// existence check and the insert. The unique index rejects the insert, and the
+// caller must resolve to the existing record instead of failing.
+//
+// Driving it this way rather than with goroutines is deliberate: SQLite
+// serialises writers, so a concurrent test never actually interleaves at the
+// point that matters and passes whether or not the recovery exists.
+func TestCreateMediaRecoversFromLostRace(t *testing.T) {
+	app := newTestApp(t)
+	media := testMedia("4962")
+
+	winnerURLID, created, err := ensureMedia(app, media, "", testPlayer("dai02"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("expected the first caller to create the Media")
+	}
+
+	// the loser reaches the insert believing the Media is new
+	urlID, created, err := createMedia(app, media, "", testPlayer("hisname"), true)
+	if err != nil {
+		t.Fatalf("losing the race returned an error instead of resolving: %v", err)
+	}
+	if created {
+		t.Fatal("the loser reported creating a Media that already existed")
+	}
+	if urlID != winnerURLID {
+		t.Fatalf("loser got url_id %d, want the winner's %d", urlID, winnerURLID)
+	}
+
+	records, err := app.FindAllRecords("medias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 medias record, got %d - the duplicate was created anyway", len(records))
 	}
 }

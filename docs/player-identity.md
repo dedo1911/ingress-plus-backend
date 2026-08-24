@@ -47,9 +47,46 @@ Add to **both** `medias` and `media_uploads`:
 | --- | --- | --- |
 | `player` | relation → `players` | max 1, optional |
 
-Also add a **unique index on `medias.url_id`** if one does not already exist.
-`ensureMedia` allocates the id and inserts inside a transaction, but without the
-index a duplicate would still pass silently rather than being rejected.
+Also add two unique indexes to `medias`:
+
+| Index | Why |
+| --- | --- |
+| unique on `media_id` | Niantic's id is the natural key. Without it two uploads of the same new Media can each create a record. |
+| unique on `url_id` | The public identifier in `/media/<url_id>`. A duplicate means two records answer to the same URL. |
+
+**Both will be rejected until the existing duplicates are removed** — see
+"Cleaning up the duplicate media" below.
+
+`createMedia` allocates the url_id and inserts inside a transaction, but the
+existence check that precedes it runs outside, so two requests can both pass it.
+The indexes are what actually enforce uniqueness; the code turns their rejection
+into "someone else discovered it first" rather than a 500.
+
+## Cleaning up the duplicate media
+
+Production carries 7 duplicated `media_id`s, all created within two seconds of
+each other on 2024-11-01 by a single agent's upload — concurrent requests that
+each passed the existence check. Five pairs were assigned consecutive url_ids;
+two pairs collided on the same url_id, which is what blocks the index.
+
+| media_id | keep | delete | url_id of the deleted copy | media_uploads rows on it |
+| --- | --- | --- | --- | --- |
+| 4959 | `1h2kge9o6euz1uf` | `a8kpohh37vrhibe` | 12464 | 0 |
+| 4962 | `7uzzky146p1uis5` | `520ifc8hpbiglgd` | 12465 (shared) | — |
+| 4968 | `go9vt10pz28dbu8` | `10r1kw5udfh3419` | 12469 | 0 |
+| 4969 | `8tcwpijphxeyr8z` | `one7kk247inuhrz` | 12471 | 0 |
+| 4970 | `d802za8o34eo331` | `60lsek843jhypf4` | 12473 | 0 |
+| 4971 | `z5btpnv8jrb0mk3` | `pfcl750kjvdbixg` | 12475 | 0 |
+| 5003 | `sozbjsmk9gt8ji7` | `vaoixtf4nvblmsv` | 12489 (shared) | — |
+
+Each pair is byte-identical — same media_id, short_description, level, topic and
+destination — so nothing is lost by dropping one. The copy to keep is the one
+holding the url_id that `media_uploads` rows actually reference; for the five
+consecutive-id pairs the second record has no rows pointing at it at all, and
+for the two shared-id pairs the single row survives either way because it
+references the url_id, not the record.
+
+Delete the seven records in the right-hand column, then add the indexes.
 
 ## 4. Rollout order
 
