@@ -112,8 +112,12 @@ records.
 
 5. Assign the 17 sub-threshold usernames by hand, using the printed report.
    The 48 unattributed records need nothing: they fill themselves in.
-6. Once verified, drop the now-redundant `media_uploads.agent_guid_hashed`
-   column — it was added for this purpose but never populated.
+6. Once verified, drop `media_uploads.agent_guid_hashed`. It was added for this
+   purpose and never populated; the `player` relation supersedes it.
+7. Retiring v1 is a **separate deploy**. Doing it in the same release as the
+   hashing would break every out-of-date plugin at the same moment the backfill
+   runs, and those are two unrelated things to debug at once. Ship hashing,
+   confirm the backfill, then ship the retirement.
 
 The backfill is idempotent and can be re-run.
 
@@ -184,3 +188,86 @@ rather than data that never carried an ID.
 
 IDs are lowercased before hashing so that the same UUID in different cases can
 never fork into two identities.
+
+
+---
+
+# Decided, not yet built
+
+Design decisions taken while building the hashing, recorded so the follow-up
+work does not have to re-litigate them.
+
+## Deduplicating media_uploads by identity
+
+`media_uploads` is uniquely indexed on `(media_url_id, uploader_ign)`, so a
+renamed agent gets a **second row** for a media they had already uploaded. That
+inflates `total_media_uploads`, splits them on any ign-grouped leaderboard, and
+makes `firstTimeUserUploadCount` overcount for that upload.
+
+The fix is to dedupe on the identity instead:
+
+- `ensureUpload` looks up `(media_url_id, player)` first when a player is known,
+  falling back to `(media_url_id, uploader_ign)` when it is not.
+- On a match, the existing row is **left untouched** - `uploader_ign` stays
+  frozen at the name used at the time. `players.last_ign` carries the current
+  one, so nothing is lost and 11877 historical rows are not rewritten.
+- Add a **partial** unique index:
+
+      CREATE UNIQUE INDEX idx_media_uploads_player
+        ON media_uploads (media_url_id, player) WHERE player != ''
+
+  Partial is not optional. PocketBase stores an unset relation as `''`, not
+  NULL, and roughly half the rows will never have an identity - a plain unique
+  index over those collides immediately and is rejected.
+
+## Displaying the current username
+
+`medias.uploader_ign` is the name at upload time. To show the *current* name,
+read it through the relation - `medias.player` -> `players.last_ign` - and fall
+back to `uploader_ign` when there is no player or `last_ign` is empty (the
+unattributed records have no nickname).
+
+Two schema changes make this possible:
+
+- `players.viewRule` must become public (`""`). Expand enforces the *related*
+  collection's view rule, so with `user = @request.auth.id` a logged-out visitor
+  cannot expand the relation at all.
+- `player_hash` and `user` must be marked **hidden**, which strips them from API
+  responses for everyone. Superusers are exempt (`autoResolveRecordsFlags`
+  unhides on superuser auth), so the admin panel still shows and sets them.
+
+`listRule` can stay restrictive: expand only consults `viewRule`, so the table
+still cannot be enumerated.
+
+Coverage is partial and worth stating plainly: after the backfill, 1099 of 1747
+medias have a player. The remaining 648 keep their frozen name, and the agents
+who actually renamed are mostly in that group, because their records are all
+from the legacy import.
+
+## Growing coverage from uploads
+
+An upload proves that a player ID is *currently* using a nickname, and Ingress
+never releases a username - so every `medias` and `media_uploads` row carrying
+that nickname belongs to that player. Linking them all on each upload, rather
+than only the rows being written, pulls coverage from 63% toward complete as
+agents return, using the same rule the backfill already applies.
+
+## The name-source toggle
+
+Per-agent, stored on `players` (not `users`) so it follows the Ingress identity:
+it works before an agent has an Ingress Plus account, and an admin can set it on
+request. A field such as `name_display` (`current` | `historical`, default
+`current`), left visible rather than hidden.
+
+Nothing extra is needed at read time. `expand=player` already returns
+`last_ign` and the preference alongside the media's own frozen `uploader_ign`,
+so a single query carries all three and the choice is a local expression:
+
+    historical -> media.uploader_ign
+    current    -> player.last_ign || media.uploader_ign
+
+Writing it is the fiddly part, since `players` is superuser-only. Either add an
+update rule scoped to the one field with the `@request.body.<field>` pattern
+already used by `users.updateRule`, or expose a small authenticated route that
+sets it for the caller's linked player. Only verified agents can set it at all -
+an unverified `players` record has no `user`, so there is nobody to authorise.

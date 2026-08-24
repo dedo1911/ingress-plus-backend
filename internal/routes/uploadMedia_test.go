@@ -2,6 +2,8 @@ package routes
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -462,5 +464,45 @@ func TestCreateMediaRecoversFromLostRace(t *testing.T) {
 	}
 	if len(records) != 1 {
 		t.Fatalf("expected 1 medias record, got %d - the duplicate was created anyway", len(records))
+	}
+}
+
+// TestUploadMediaV1IsRetired pins the one thing the retired endpoint still has
+// to do: tell an agent on an out-of-date plugin why their upload failed. Every
+// plugin release from 1.0.2 onwards appends the response body to the alert it
+// shows, so this text is what they actually read.
+func TestUploadMediaV1IsRetired(t *testing.T) {
+	app := newTestApp(t)
+
+	e := &core.RequestEvent{App: app}
+	e.Request = httptest.NewRequest("POST", "/api/mediagress/v1/upload-media", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	e.Response = rec
+
+	if err := UploadMediaV1()(e); err != nil {
+		t.Fatalf("retired handler returned an error: %v", err)
+	}
+
+	if rec.Code != http.StatusGone {
+		t.Errorf("status = %d, want %d (Gone)", rec.Code, http.StatusGone)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "https://ingress.plus/media/upload") {
+		t.Errorf("response does not tell the agent where to get the new plugin: %q", body)
+	}
+	if strings.Contains(body, "\n") {
+		t.Errorf("response spans multiple lines; it is rendered inside an alert box: %q", body)
+	}
+
+	// nothing may be written - a retired endpoint must not half-record an upload
+	for _, collection := range []string{"medias", "media_uploads", "players"} {
+		records, err := app.FindAllRecords(collection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) != 0 {
+			t.Errorf("%s got %d records from a retired endpoint, want 0", collection, len(records))
+		}
 	}
 }

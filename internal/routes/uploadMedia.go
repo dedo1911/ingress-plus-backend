@@ -65,9 +65,9 @@ type UploadMediaRequest struct {
 }
 
 // uploadMediaOptions carries the deliberate behaviour differences between
-// the two versions of the endpoint. v1 is frozen: it has to keep matching
-// what pb_hooks/mediagress.pb.js did, because clients too old to be
-// updated still call it.
+// the versions of the endpoint. Only v2 still uploads; v1 is retired (see
+// UploadMediaV1) and the option kept for it is the one thing that would have
+// to come back if that were ever reversed.
 //
 // Note that per-agent upload tracking is *not* one of the differences. It
 // used to be - v2 recorded a media_uploads row only for media it had just
@@ -76,7 +76,7 @@ type UploadMediaRequest struct {
 // already-known ones silently dropped most contributions. See uploadMedia.
 type uploadMediaOptions struct {
 	// approveNewMedia is the "approved" value for freshly created media
-	// records: v1 queues them for manual review, v2 publishes them
+	// records: v1 queued them for manual review, v2 publishes them
 	// straight away.
 	approveNewMedia bool
 
@@ -88,15 +88,31 @@ type uploadMediaOptions struct {
 	hasher   *players.Hasher
 }
 
-// UploadMediaV1 handles POST /api/mediagress/v1/upload-media, the legacy
-// endpoint kept alive for clients that were never updated to v2.
-func UploadMediaV1(telegram *notify.Telegram, hasher *players.Hasher) func(*core.RequestEvent) error {
-	return uploadMedia(uploadMediaOptions{
-		approveNewMedia: false,
-		legacyResponse:  true,
-		telegram:        telegram,
-		hasher:          hasher,
-	})
+// v1RetiredMessage is shown to agents still running a plugin that posts to v1.
+//
+// Every plugin release from 1.0.2 onwards appends the response body to the
+// alert it shows ("... Error: 410 Gone: <this text>"), so this is the last
+// chance to tell those agents anything at all - after the route is removed
+// they get a bare 404. Kept to one plain-text line for that reason: it lands
+// inside an alert box, not in a console.
+const v1RetiredMessage = "Your Mediagress plugin is out of date and your uploads are no longer being saved. " +
+	"Please install the current version from https://ingress.plus/media/upload and upload again."
+
+// UploadMediaV1 handles POST /api/mediagress/v1/upload-media, which is
+// retired. It answers 410 Gone with an actionable message rather than simply
+// disappearing, so agents on an old plugin are told why their uploads stopped
+// working and what to do about it.
+//
+// This is the grace period, not the end state: once the message has been live
+// long enough for the userscript's auto-update to have reached everyone, drop
+// the route registration in main.go and let it 404.
+func UploadMediaV1() func(*core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		e.App.Logger().InfoContext(e.Request.Context(), "Rejected an upload from a retired plugin version",
+			slog.String("endpoint", "v1"), slog.String("userAgent", e.Request.UserAgent()))
+
+		return e.String(http.StatusGone, v1RetiredMessage)
+	}
 }
 
 // UploadMediaV2 handles POST /api/mediagress/v2/upload-media.
