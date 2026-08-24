@@ -53,9 +53,14 @@ index a duplicate would still pass silently rather than being rejected.
 
 ## 4. Rollout order
 
+Both upload endpoints hash. v1 is the legacy route ported out of `pb_hooks` and
+still serves clients that were never updated to v2 — it was carrying most of the
+traffic — so leaving it unhashed would have kept writing raw player IDs into new
+records.
+
 1. Apply the schema above and set the pepper.
-2. Deploy. New uploads are hashed and attributed from this point on; the raw IDs
-   of existing records are untouched so far.
+2. Deploy. New uploads on **both v1 and v2** are hashed and attributed from this
+   point on; the raw IDs of existing records are untouched so far.
 3. Dry-run the backfill and read the report:
 
        ./ingress-plus backfill-player-hashes --dry-run
