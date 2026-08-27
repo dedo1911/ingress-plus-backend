@@ -159,6 +159,7 @@ func uploadMedia(opts uploadMediaOptions) func(*core.RequestEvent) error {
 		e.App.Logger().DebugContext(e.Request.Context(), "Received upload media request", slog.String("player", data.Player.Nickname))
 
 		playerRecordID := resolvePlayer(e, opts.hasher, data)
+		claimHistory(e, playerRecordID, data.Player.Nickname)
 
 		newMedias := 0
 		firstTimeUserUploads := 0
@@ -238,6 +239,32 @@ func resolvePlayer(e *core.RequestEvent, hasher *players.Hasher, data UploadMedi
 	}
 
 	return ""
+}
+
+// claimHistory attaches the agent's earlier, unattributed uploads to the player
+// record this upload just identified, so coverage grows as agents return rather
+// than only from the moment they were first seen.
+//
+// Advisory: a failure or a conflict leaves the upload itself unaffected. The
+// rows it would have linked stay unattributed, and the next upload tries again.
+func claimHistory(e *core.RequestEvent, playerRecordID, nickname string) {
+	result, err := players.ClaimHistory(e.App, playerRecordID, nickname)
+	if err != nil {
+		e.App.Logger().ErrorContext(e.Request.Context(), "Failed to link an agent's earlier uploads",
+			slog.String("player", nickname), slog.Any("error", err))
+		return
+	}
+
+	if result.Conflict {
+		e.App.Logger().WarnContext(e.Request.Context(), "Nickname is already attributed to a different player, left alone",
+			slog.String("player", nickname))
+		return
+	}
+
+	if result.Linked > 0 {
+		e.App.Logger().InfoContext(e.Request.Context(), "Linked an agent's earlier uploads",
+			slog.String("player", nickname), slog.Int("rows", result.Linked))
+	}
 }
 
 // stripPlayerID clears the raw player ID so it never reaches original_data.
@@ -335,24 +362,28 @@ func createMedia(app core.App, media Media, playerRecordID string, player Player
 }
 
 // ensureUpload records that this agent has uploaded this Media, returning
-// whether it was their first time. media_uploads is uniquely indexed on
-// (media_url_id, uploader_ign), so this is a find-or-create.
+// whether it was their first time.
 //
-// An existing row that predates player attribution is linked opportunistically,
-// which is how history gets filled in for agents who keep uploading.
+// Find-or-create, keyed on the player record when the agent is identified and
+// on their nickname when they are not. Identity first is what stops a renamed
+// agent getting a second row for a Media they had already uploaded, which would
+// inflate the upload totals and split them across two names on any
+// ign-grouped leaderboard.
+//
+// A matched row is left exactly as it is. uploader_ign stays frozen at the name
+// used at the time, which is the historical record; players.last_ign carries
+// the current one, and the two together are what let the site offer either.
 func ensureUpload(app core.App, urlID int, playerRecordID string, player Player) (bool, error) {
 	mediaURLID := strconv.Itoa(urlID)
 
-	existing, err := app.FindFirstRecordByFilter(
-		"media_uploads",
-		"media_url_id = {:media_url_id} && uploader_ign = {:uploader_ign}",
-		dbx.Params{"media_url_id": mediaURLID, "uploader_ign": player.Nickname},
-	)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	existing, err := findUpload(app, mediaURLID, playerRecordID, player.Nickname)
+	if err != nil {
 		return false, err
 	}
 
 	if existing != nil {
+		// An older row from before this agent was identified. Linking it here
+		// is what lets ClaimHistory's guard protect them from then on.
 		if playerRecordID != "" && existing.GetString("player") == "" {
 			existing.Set("player", playerRecordID)
 			if err := app.Save(existing); err != nil {
@@ -376,17 +407,53 @@ func ensureUpload(app core.App, urlID int, playerRecordID string, player Player)
 	}
 
 	if err := app.Save(record); err != nil {
-		// Lost the race on the unique index - the row we wanted now exists, so
-		// this is not this agent's first upload of it.
-		if _, findErr := app.FindFirstRecordByFilter(
-			"media_uploads",
-			"media_url_id = {:media_url_id} && uploader_ign = {:uploader_ign}",
-			dbx.Params{"media_url_id": mediaURLID, "uploader_ign": player.Nickname},
-		); findErr == nil {
+		// Lost the race on one of the unique indexes - the row we wanted now
+		// exists, so this is not this agent's first upload of it.
+		if found, findErr := findUpload(app, mediaURLID, playerRecordID, player.Nickname); findErr == nil && found != nil {
 			return false, nil
 		}
 		return false, err
 	}
 
 	return true, nil
+}
+
+// findUpload locates this agent's existing row for a Media: by identity when
+// one is known, falling back to the nickname.
+//
+// The fallback is not redundant. Roughly half of media_uploads will never have
+// an identity - agents who only ever uploaded Media someone else had already
+// discovered leave no player ID anywhere - and a returning agent's own older
+// rows are unlinked until this finds them.
+func findUpload(app core.App, mediaURLID, playerRecordID, nickname string) (*core.Record, error) {
+	if playerRecordID != "" {
+		record, err := app.FindFirstRecordByFilter(
+			"media_uploads",
+			"media_url_id = {:media_url_id} && player = {:player}",
+			dbx.Params{"media_url_id": mediaURLID, "player": playerRecordID},
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if record != nil {
+			return record, nil
+		}
+	}
+
+	// An empty nickname matches nobody in particular, so it must not be used
+	// to look one up - it would collide with every other anonymous row.
+	if nickname == "" {
+		return nil, nil
+	}
+
+	record, err := app.FindFirstRecordByFilter(
+		"media_uploads",
+		"media_url_id = {:media_url_id} && uploader_ign = {:uploader_ign}",
+		dbx.Params{"media_url_id": mediaURLID, "uploader_ign": nickname},
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	return record, nil
 }

@@ -65,6 +65,10 @@ func newTestApp(t *testing.T) *tests.TestApp {
 	uploads.Fields.Add(&core.TextField{Name: "uploader_faction"})
 	uploads.Fields.Add(&core.RelationField{Name: "player", CollectionId: playersCollection.Id, MaxSelect: 1})
 	uploads.AddIndex("idx_media_uploads_unique", true, "media_url_id, uploader_ign", "")
+	// Partial on purpose: PocketBase stores an unset relation as '', not NULL,
+	// and roughly half of production has no identity - a plain unique index over
+	// those would collide on the first two unattributed rows.
+	uploads.AddIndex("idx_media_uploads_player", true, "media_url_id, player", "player != ''")
 	if err := app.Save(uploads); err != nil {
 		t.Fatalf("creating media_uploads collection: %v", err)
 	}
@@ -504,5 +508,163 @@ func TestUploadMediaV1IsRetired(t *testing.T) {
 		if len(records) != 0 {
 			t.Errorf("%s got %d records from a retired endpoint, want 0", collection, len(records))
 		}
+	}
+}
+
+// newTestPlayerRecord creates a players record for a distinct player ID, so a
+// test can act as two different agents.
+func newTestPlayerRecord(t *testing.T, app core.App, rawID, ign string) *core.Record {
+	t.Helper()
+
+	hasher, err := players.NewHasher("test-pepper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hasher.Hash(rawID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := players.Ensure(app, hash, ign, "RESISTANCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return record
+}
+
+// TestEnsureUploadDedupesAcrossRename is the point of keying on the player
+// record: an agent who changes their username must not acquire a second row for
+// a Media they had already uploaded, which would double-count them in the
+// totals and split them across two names on the leaderboards.
+func TestEnsureUploadDedupesAcrossRename(t *testing.T) {
+	app := newTestApp(t)
+
+	record := newTestPlayerRecord(t, app, testPlayerID, "oldname")
+
+	if _, err := ensureUpload(app, 1, record.Id, testPlayer("oldname")); err != nil {
+		t.Fatal(err)
+	}
+
+	firstTime, err := ensureUpload(app, 1, record.Id, testPlayer("newname"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstTime {
+		t.Fatal("the same player under a new nickname counted as a first upload")
+	}
+
+	rows, err := app.FindAllRecords("media_uploads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("a rename produced %d rows for one Media, want 1", len(rows))
+	}
+	// The name at upload time is the historical record and stays put;
+	// players.last_ign is where the current name lives.
+	if got := rows[0].GetString("uploader_ign"); got != "oldname" {
+		t.Fatalf("the existing row's nickname was rewritten: got %q, want %q", got, "oldname")
+	}
+}
+
+// TestClaimHistoryLinksEarlierUploads covers the coverage-growth path: an
+// upload proves who a nickname belongs to, so every earlier row under that name
+// can be attributed, not just the row being written now.
+func TestClaimHistoryLinksEarlierUploads(t *testing.T) {
+	app := newTestApp(t)
+
+	// history from before the agent was ever identified
+	for _, urlID := range []int{1, 2, 3} {
+		if _, err := ensureUpload(app, urlID, "", testPlayer("oscarc1")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := ensureMedia(app, testMedia("5000"), "", testPlayer("oscarc1"), true); err != nil {
+		t.Fatal(err)
+	}
+
+	record := newTestPlayerRecord(t, app, testPlayerID, "oscarc1")
+
+	result, err := players.ClaimHistory(app, record.Id, "oscarc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Conflict {
+		t.Fatal("claiming an unattributed nickname was reported as a conflict")
+	}
+	if result.Linked != 4 {
+		t.Fatalf("linked %d rows, want 4 (3 uploads + 1 media)", result.Linked)
+	}
+
+	rows, err := app.FindAllRecords("media_uploads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if got := row.GetString("player"); got != record.Id {
+			t.Fatalf("an earlier upload was left unlinked: got %q, want %q", got, record.Id)
+		}
+	}
+}
+
+// TestClaimHistoryRefusesAnotherPlayersName is the guard that makes the sweep
+// safe on an unauthenticated route. The nickname in an upload is self-asserted,
+// so without this anyone with C.O.R.E. could post a single media under a
+// well-known agent's name and take over their entire upload history.
+func TestClaimHistoryRefusesAnotherPlayersName(t *testing.T) {
+	app := newTestApp(t)
+
+	owner := newTestPlayerRecord(t, app, testPlayerID, "dai02")
+	if _, err := ensureUpload(app, 1, owner.Id, testPlayer("dai02")); err != nil {
+		t.Fatal(err)
+	}
+	// an older row the owner has not been linked to yet
+	if _, err := ensureUpload(app, 2, "", testPlayer("dai02")); err != nil {
+		t.Fatal(err)
+	}
+
+	impostor := newTestPlayerRecord(t, app, "0edba40ac0ffee00deadbeef12345678.c", "impostor")
+
+	result, err := players.ClaimHistory(app, impostor.Id, "dai02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Conflict {
+		t.Fatal("claiming a nickname owned by another player was not flagged as a conflict")
+	}
+	if result.Linked != 0 {
+		t.Fatalf("a conflicting claim linked %d rows, want 0", result.Linked)
+	}
+
+	rows, err := app.FindAllRecords("media_uploads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if got := row.GetString("player"); got == impostor.Id {
+			t.Fatal("a row was handed to the impostor")
+		}
+	}
+}
+
+// TestClaimHistoryIgnoresScrubbedAttribution keeps the sweep away from the
+// marker moderators leave when they strip an upload's attribution. It names no
+// agent, so claiming everything under it would hand one player a pile of
+// deliberately anonymised uploads.
+func TestClaimHistoryIgnoresScrubbedAttribution(t *testing.T) {
+	app := newTestApp(t)
+
+	if _, err := ensureUpload(app, 1, "", testPlayer("UNKNOWN")); err != nil {
+		t.Fatal(err)
+	}
+
+	record := newTestPlayerRecord(t, app, testPlayerID, "UNKNOWN")
+
+	result, err := players.ClaimHistory(app, record.Id, "UNKNOWN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Linked != 0 {
+		t.Fatalf("claimed %d scrubbed rows, want 0", result.Linked)
 	}
 }
