@@ -81,7 +81,12 @@ func NewCommand(app *pocketbase.PocketBase) *cobra.Command {
 func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) error {
 	var rows []mediaRow
 	if err := app.DB().
-		NewQuery("SELECT id, uploader_ign, created, original_data FROM medias").
+		// COALESCE: 20 production rows have original_data NULL, and scanning
+		// NULL into mediaRow.OriginalData fails outright. Empty string is the
+		// right stand-in - rawPlayerID cannot parse it, IsPlayerID rejects the
+		// result, and the record lands in the "scrubbed / no player ID" count
+		// exactly where a record with no playerId key belongs.
+		NewQuery("SELECT id, uploader_ign, created, COALESCE(original_data, '') AS original_data FROM medias").
 		All(&rows); err != nil {
 		return fmt.Errorf("reading medias: %w", err)
 	}
