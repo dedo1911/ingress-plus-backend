@@ -29,7 +29,7 @@ there so the admin panel has something readable to match against.
 | `player_hash` | text | required; **add a unique index** |
 | `user` | relation → `users` | max 1, optional — set only by the verification flow |
 | `last_ign` | text | most recently seen nickname |
-| `last_faction` | text | plain text, not select: the value is client-supplied |
+| `last_faction` | text | plain text, not select: the value is client-supplied. Uppercase (`RESISTANCE`), matching `medias.uploader_faction` rather than lowercase `users.faction` |
 | `verified_at` | date | optional |
 
 API rules:
@@ -120,15 +120,16 @@ records.
        ./ingress-plus backfill-player-hashes --dry-run
 
    Against production data as of 2026-08-24 this reports 1754 medias scanned,
-   22 scrubbed or without a player ID, 81 distinct player IDs, and 33 trusted
-   username mappings — 16 above the trust threshold and 17 listed for manual
-   assignment.
+   22 scrubbed or without a player ID, 81 distinct player IDs and 33 trusted
+   username mappings, 17 of them resting on fewer than three records each.
+   All 33 are assigned; the thin ones are listed only so they can be eyeballed.
 4. Run it for real:
 
        ./ingress-plus backfill-player-hashes
 
-5. Assign the 17 sub-threshold usernames by hand, using the printed report.
-   The 48 unattributed records need nothing: they fill themselves in.
+5. Glance at the thinly evidenced mappings in the report. Nothing to do unless
+   one looks wrong. The 48 unattributed player records need nothing either:
+   they fill themselves in as those agents upload again.
 6. Add the partial unique index on `media_uploads (media_url_id, player)`.
    It has to come after the backfill - see above.
 7. Once verified, drop `media_uploads.agent_guid_hashed`. It was added for this
@@ -146,8 +147,8 @@ individually would misattribute them.
 
 Instead it derives a `username → player` map from the plugin-era records only,
 where the data is perfectly consistent (33 usernames, 33 players, one to one),
-requires at least 3 records before trusting a mapping, and then applies that map
-by username across every record including the legacy ones. This is sound because
+and then applies that map by username across every record including the legacy
+ones. This is sound because
 an Ingress username, once taken, is never released to another agent — so a
 proven `(username, player)` pair holds for every record that username ever
 touched. It is also the only way to attribute `media_uploads` at all, since that
@@ -156,6 +157,27 @@ table never stored a player ID.
 A username that resolves to more than one player is dropped rather than guessed
 at. Renames are the mirror image and are kept: one player legitimately appears
 under several usernames, each of which was theirs alone.
+
+## Why there is no trust threshold
+
+An earlier version of this command required three consistent records before it
+would trust a `username -> player` mapping, and printed the rest for an admin to
+assign by hand. That gate is gone, and the 17 mappings it was withholding — 95
+medias and 1642 upload rows belonging to ordinary agents — are now assigned like
+any other.
+
+It was guarding against a record's `original_data` not belonging to its
+`uploader_ign`, which is real but confined to the legacy import, and
+`buildMappings` already excludes that import wholesale. What settled it is that
+a plugin-era record is direct evidence rather than an inference: an item's
+`inInventory` block is rewritten when the item changes hands — verified against
+a real inventory, where a Media released in 2016 carried the current holder's ID
+and an acquisition timestamp from the day it was read — so the player ID in a
+plugin-era record is the uploader's own, pulled from their inventory in the same
+request that carried their nickname. One such record proves the pair.
+
+The report still lists mappings resting on fewer than `thinEvidenceRecords`
+records, as information rather than as a gate.
 
 ## Hashes without an owner
 
@@ -250,10 +272,9 @@ reach, as is everything any agent has since claimed for themselves — including
 after their first upload, the row `ensureUpload` had just linked.
 
 What remains exposed is a nickname that has **never** been attributed to anyone:
-the 17 sub-threshold usernames until an admin assigns them, and the agents who
-never discovered a new Media in the plugin era. An attacker would have to know
-such a name and get there before the real agent's next upload. Assigning the 17
-promptly closes most of it; the rest closes itself as agents return.
+the agents who never discovered a new Media in the plugin era, so no player ID
+for them exists anywhere. An attacker would have to know such a name and get
+there before the real agent's next upload. That closes itself as agents return.
 
 This is a narrowing, not a fix. Verification (phase 2) is what makes attribution
 trustworthy — the sweep only decides who gets the benefit of the doubt first.

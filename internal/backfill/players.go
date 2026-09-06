@@ -22,14 +22,24 @@ import (
 // from those records only.
 const legacyImportDate = "2024-01-11"
 
-// minRecordsToTrustMapping is how many consistent records a username needs
-// before its player ID is taken as proven. Below this an admin assigns it by
-// hand from the report this command prints.
-const minRecordsToTrustMapping = 3
+// thinEvidenceRecords is how many records a mapping needs before it stops
+// being worth calling out in the report. It is *not* a gate - every mapping
+// below it is still assigned.
+//
+// There used to be a gate here, on the theory that a record's original_data
+// might not belong to its uploader_ign. That only ever applied to the legacy
+// import, which buildMappings already excludes wholesale, and a plugin-era
+// record turns out to be direct evidence rather than an inference: an item's
+// inInventory block is rewritten when it changes hands, so the player ID in it
+// is the uploader's own, read from their inventory in the same request that
+// carried their nickname. Gating on a count of those withheld 95 medias and
+// 1642 upload rows from 17 ordinary agents for nothing.
+const thinEvidenceRecords = 3
 
 type mediaRow struct {
 	ID           string `db:"id"`
 	UploaderIgn  string `db:"uploader_ign"`
+	Faction      string `db:"uploader_faction"`
 	Created      string `db:"created"`
 	OriginalData string `db:"original_data"`
 }
@@ -37,6 +47,7 @@ type mediaRow struct {
 type mapping struct {
 	hash    string
 	ign     string
+	faction string
 	records int
 	latest  string
 }
@@ -86,7 +97,7 @@ func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) 
 		// right stand-in - rawPlayerID cannot parse it, IsPlayerID rejects the
 		// result, and the record lands in the "scrubbed / no player ID" count
 		// exactly where a record with no playerId key belongs.
-		NewQuery("SELECT id, uploader_ign, created, COALESCE(original_data, '') AS original_data FROM medias").
+		NewQuery("SELECT id, uploader_ign, COALESCE(uploader_faction, '') AS uploader_faction, created, COALESCE(original_data, '') AS original_data FROM medias").
 		All(&rows); err != nil {
 		return fmt.Errorf("reading medias: %w", err)
 	}
@@ -94,27 +105,23 @@ func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) 
 	trusted, skipped := buildMappings(rows, hasher)
 	hashes := collectHashes(rows, hasher)
 
-	auto := map[string]mapping{}
-	var review []mapping
+	var thin []mapping
 	for _, m := range trusted {
-		if m.records >= minRecordsToTrustMapping {
-			auto[m.ign] = m
-			continue
+		if m.records < thinEvidenceRecords {
+			thin = append(thin, m)
 		}
-		review = append(review, m)
 	}
 
 	cmd.Printf("medias scanned:            %d\n", len(rows))
 	cmd.Printf("scrubbed / no player ID:   %d\n", skipped)
 	cmd.Printf("distinct player IDs:       %d\n", len(hashes))
-	cmd.Printf("trusted username mappings: %d (%d auto-assignable, %d for manual review)\n",
-		len(trusted), len(auto), len(review))
+	cmd.Printf("trusted username mappings: %d\n", len(trusted))
 
-	if len(review) > 0 {
-		sort.Slice(review, func(i, j int) bool { return review[i].ign < review[j].ign })
-		cmd.Println("\nbelow the trust threshold - assign these by hand in the admin panel:")
-		for _, m := range review {
-			cmd.Printf("  %-18s %s  (%d record(s))\n", m.ign, m.hash[:16], m.records)
+	if len(thin) > 0 {
+		sort.Slice(thin, func(i, j int) bool { return thin[i].ign < thin[j].ign })
+		cmd.Printf("\nassigned on fewer than %d records each - worth a glance:\n", thinEvidenceRecords)
+		for _, m := range thin {
+			cmd.Printf("  %-18s %s  %-12s (%d record(s))\n", m.ign, m.hash[:16], m.faction, m.records)
 		}
 	}
 
@@ -124,25 +131,25 @@ func run(app core.App, hasher *players.Hasher, dryRun bool, cmd *cobra.Command) 
 	}
 
 	// Every distinct player ID gets a players record - the trusted mappings
-	// carry their nickname, the rest are created bare and stay unlinked.
-	hashToIgn := map[string]string{}
+	// carry their nickname and faction, the rest are created bare and stay
+	// unlinked.
+	byHash := map[string]mapping{}
 	for _, m := range trusted {
-		hashToIgn[m.hash] = m.ign
+		byHash[m.hash] = m
 	}
 
 	hashToRecordID := map[string]string{}
 	for _, hash := range hashes {
-		record, err := players.Ensure(app, hash, hashToIgn[hash], "")
+		m := byHash[hash]
+		record, err := players.Ensure(app, hash, m.ign, m.faction)
 		if err != nil {
 			return fmt.Errorf("creating player record for %s: %w", hash[:16], err)
 		}
 		hashToRecordID[hash] = record.Id
 	}
 
-	// Only mappings above the trust threshold are attached to records;
-	// everything else waits for a human.
 	ignToRecordID := map[string]string{}
-	for _, m := range auto {
+	for _, m := range trusted {
 		ignToRecordID[m.ign] = hashToRecordID[m.hash]
 	}
 
@@ -178,6 +185,7 @@ func buildMappings(rows []mediaRow, hasher *players.Hasher) ([]mapping, int) {
 	type counter struct {
 		records int
 		latest  string
+		faction string
 	}
 
 	byIgn := map[string]map[string]*counter{}
@@ -210,6 +218,10 @@ func buildMappings(rows []mediaRow, hasher *players.Hasher) ([]mapping, int) {
 		c.records++
 		if row.Created > c.latest {
 			c.latest = row.Created
+			// Newest wins, same rule as the nickname: an agent can change
+			// faction, and only the plugin-era rows are trustworthy enough to
+			// read it from.
+			c.faction = row.Faction
 		}
 	}
 
@@ -219,7 +231,7 @@ func buildMappings(rows []mediaRow, hasher *players.Hasher) ([]mapping, int) {
 			continue
 		}
 		for hash, c := range hashes {
-			out = append(out, mapping{hash: hash, ign: ign, records: c.records, latest: c.latest})
+			out = append(out, mapping{hash: hash, ign: ign, faction: c.faction, records: c.records, latest: c.latest})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ign < out[j].ign })
