@@ -131,9 +131,12 @@ func TestBuildMappingsKeepsRenames(t *testing.T) {
 	}
 }
 
-func TestBuildMappingsCountsRecordsForTrustThreshold(t *testing.T) {
+// Record counts are no longer a gate - every mapping is assigned - but the
+// report still calls out the thinly evidenced ones, so the count has to be
+// right.
+func TestBuildMappingsCountsRecords(t *testing.T) {
 	var rows []mediaRow
-	for i := 0; i < minRecordsToTrustMapping; i++ {
+	for i := 0; i < 3; i++ {
 		rows = append(rows, mediaRow{
 			ID:           string(rune('a' + i)),
 			UploaderIgn:  "prolific",
@@ -149,11 +152,31 @@ func TestBuildMappingsCountsRecordsForTrustThreshold(t *testing.T) {
 	for _, m := range got {
 		counts[m.ign] = m.records
 	}
-	if counts["prolific"] < minRecordsToTrustMapping {
-		t.Fatalf("prolific agent counted %d records, want at least %d", counts["prolific"], minRecordsToTrustMapping)
+	if counts["prolific"] != 3 {
+		t.Fatalf("prolific agent counted %d records, want 3", counts["prolific"])
 	}
-	if counts["occasional"] >= minRecordsToTrustMapping {
-		t.Fatalf("occasional agent should fall below the trust threshold, counted %d", counts["occasional"])
+	if counts["occasional"] != 1 {
+		t.Fatalf("occasional agent counted %d records, want 1", counts["occasional"])
+	}
+	if len(got) != 2 {
+		t.Fatalf("both agents should be assigned, got %d mappings", len(got))
+	}
+}
+
+// Faction follows the newest record for the same reason the nickname does: an
+// agent can switch, and whatever we saw last is the current one.
+func TestBuildMappingsTakesTheNewestFaction(t *testing.T) {
+	rows := []mediaRow{
+		{ID: "1", UploaderIgn: "switcher", Faction: "ENLIGHTENED", Created: "2025-01-01 00:00:00.000Z", OriginalData: payload(playerA)},
+		{ID: "2", UploaderIgn: "switcher", Faction: "RESISTANCE", Created: "2026-01-01 00:00:00.000Z", OriginalData: payload(playerA)},
+	}
+
+	got, _ := buildMappings(rows, testHasher(t))
+	if len(got) != 1 {
+		t.Fatalf("expected one mapping, got %+v", got)
+	}
+	if got[0].faction != "RESISTANCE" {
+		t.Fatalf("faction = %q, want the newest record's RESISTANCE", got[0].faction)
 	}
 }
 
