@@ -12,13 +12,17 @@ import (
 	"time"
 
 	"github.com/dedo1911/ingress-plus-backend/internal/notify"
+	"github.com/dedo1911/ingress-plus-backend/internal/players"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 )
 
 type Media struct {
 	InInventory struct {
-		PlayerID               string `json:"playerId"`
+		// PlayerID is read from the upload and hashed, then cleared before the
+		// payload is stored - see stripPlayerID. omitempty keeps the key out of
+		// original_data entirely rather than leaving a telltale empty string.
+		PlayerID               string `json:"playerId,omitempty"`
 		AcquisitionTimestampMs string `json:"acquisitionTimestampMs"`
 	} `json:"inInventory"`
 	ResourceWithLevels struct {
@@ -64,46 +68,66 @@ type UploadMediaRequest struct {
 // the two versions of the endpoint. v1 is frozen: it has to keep matching
 // what pb_hooks/mediagress.pb.js did, because clients too old to be
 // updated still call it.
+//
+// Note that per-agent upload tracking is *not* one of the differences. It
+// used to be - v2 recorded a media_uploads row only for media it had just
+// created - but that was a defect rather than a decision: media_uploads is
+// the log of every agent's upload of every Media, so skipping the
+// already-known ones silently dropped most contributions. See uploadMedia.
 type uploadMediaOptions struct {
 	// approveNewMedia is the "approved" value for freshly created media
 	// records: v1 queues them for manual review, v2 publishes them
 	// straight away.
 	approveNewMedia bool
 
-	// trackKnownMediaUploads records an upload attempt for media the
-	// database already knows about, so v1 keeps building the per-agent
-	// upload history for every media in the payload. v2 only tracks the
-	// media it just created.
-	trackKnownMediaUploads bool
-
 	// legacyResponse returns the single-field v1 response body instead of
 	// the richer v2 one, since old clients parse it strictly.
 	legacyResponse bool
 
 	telegram *notify.Telegram
+	hasher   *players.Hasher
 }
 
 // UploadMediaV1 handles POST /api/mediagress/v1/upload-media, the legacy
 // endpoint kept alive for clients that were never updated to v2.
-func UploadMediaV1(telegram *notify.Telegram) func(*core.RequestEvent) error {
+func UploadMediaV1(telegram *notify.Telegram, hasher *players.Hasher) func(*core.RequestEvent) error {
 	return uploadMedia(uploadMediaOptions{
-		approveNewMedia:        false,
-		trackKnownMediaUploads: true,
-		legacyResponse:         true,
-		telegram:               telegram,
+		approveNewMedia: false,
+		legacyResponse:  true,
+		telegram:        telegram,
+		hasher:          hasher,
 	})
 }
 
 // UploadMediaV2 handles POST /api/mediagress/v2/upload-media.
-func UploadMediaV2(telegram *notify.Telegram) func(*core.RequestEvent) error {
+func UploadMediaV2(telegram *notify.Telegram, hasher *players.Hasher) func(*core.RequestEvent) error {
 	return uploadMedia(uploadMediaOptions{
-		approveNewMedia:        true,
-		trackKnownMediaUploads: false,
-		legacyResponse:         false,
-		telegram:               telegram,
+		approveNewMedia: true,
+		legacyResponse:  false,
+		telegram:        telegram,
+		hasher:          hasher,
 	})
 }
 
+// uploadMedia handles an upload from the Mediagress IITC plugin.
+//
+// Two collections are written, and the difference between them matters:
+//   - "medias" holds one record per Media that exists in the game, created by
+//     whoever uploaded it first.
+//   - "media_uploads" logs every agent who has ever uploaded each Media, and is
+//     what the site's contribution stats and "my uploads" are built from.
+//
+// Every upload therefore produces a media_uploads row whether or not the Media
+// itself was already known. v2 used to skip already-known media outright, so
+// repeat uploads went unrecorded and firstTimeUserUploadCount could never
+// differ from previouslyUnknownMediaCount - the "already on Mediagress but new
+// to you" case it was added for was unreachable, because the count it tested
+// was keyed on a url_id minted one line earlier.
+//
+// The route is unauthenticated: the plugin runs on intel.ingress.com with no
+// Ingress Plus session, so nickname and faction are self-asserted. Treat them
+// as display data - the hashed player ID is the identity, and only the
+// verification flow makes it trustworthy.
 func uploadMedia(opts uploadMediaOptions) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		defer e.Request.Body.Close()
@@ -118,90 +142,34 @@ func uploadMedia(opts uploadMediaOptions) func(*core.RequestEvent) error {
 
 		e.App.Logger().DebugContext(e.Request.Context(), "Received upload media request", slog.String("player", data.Player.Nickname))
 
+		playerRecordID := resolvePlayer(e, opts.hasher, data)
+		claimHistory(e, playerRecordID, data.Player.Nickname)
+
 		newMedias := 0
 		firstTimeUserUploads := 0
 		var newMediaTitles []string
 
 		for _, media := range data.Medias {
-			record, err := e.App.FindFirstRecordByData("medias", "media_id", media.StoryItem.MediaID)
-
-			if err == nil { // The media is already known
-				e.App.Logger().DebugContext(e.Request.Context(), "Existing media", slog.String("player", data.Player.Nickname), slog.String("media_id", media.StoryItem.MediaID))
-				if !opts.trackKnownMediaUploads {
-					continue
-				}
-				tracked, err := trackMediaUpload(e, data.Player, record.GetInt("url_id"))
-				if err != nil {
-					return err
-				}
-				if tracked {
-					firstTimeUserUploads++
-				}
-				continue
-			}
-
-			if !errors.Is(err, sql.ErrNoRows) { // An unexpected error occurred
-				return newErrorResponse(e, err, http.StatusInternalServerError, "Error finding media record")
-			}
-
-			// Get current max URL ID
-			var maxURLID struct {
-				Max int `db:"max"`
-			}
-			if err := e.App.DB().NewQuery("SELECT MAX(url_id) max FROM medias").One(&maxURLID); err != nil {
-				return newErrorResponse(e, err, http.StatusInternalServerError, "Error getting max URL ID")
-			}
-			urlID := maxURLID.Max + 1
-
-			// Create a new media record
-			mediaCollection, err := e.App.FindCollectionByNameOrId("medias")
+			urlID, created, err := ensureMedia(e.App, media, playerRecordID, data.Player, opts.approveNewMedia)
 			if err != nil {
-				return newErrorResponse(e, err, http.StatusInternalServerError, "Error finding medias collection")
-			}
-
-			// Parse ReleaseDate
-			ms, err := strconv.ParseInt(media.StoryItem.ReleaseDate, 10, 64)
-			if err != nil {
-				return newErrorResponse(e, err, http.StatusBadRequest, "Error parsing release date")
-			}
-			releaseDate := time.UnixMilli(ms)
-
-			rawMedia, err := json.Marshal(media)
-			if err != nil {
-				return newErrorResponse(e, err, http.StatusInternalServerError, "Error marshalling media data")
-			}
-
-			mediaRecord := core.NewRecord(mediaCollection)
-			mediaRecord.Set("url_id", urlID)
-			mediaRecord.Set("media_id", media.StoryItem.MediaID)
-			mediaRecord.Set("image_url", media.ImageByURL.ImageURL)
-			mediaRecord.Set("content_url", media.StoryItem.PrimaryURL)
-			mediaRecord.Set("short_description", media.StoryItem.ShortDescription)
-			mediaRecord.Set("description", "")
-			mediaRecord.Set("released_at", releaseDate)
-			mediaRecord.Set("uploader_ign", data.Player.Nickname)
-			mediaRecord.Set("uploader_faction", data.Player.Team)
-			mediaRecord.Set("original_data", rawMedia)
-			mediaRecord.Set("level", media.ResourceWithLevels.Level)
-			mediaRecord.Set("approved", opts.approveNewMedia)
-
-			if err := e.App.Save(mediaRecord); err != nil {
 				return newErrorResponse(e, err, http.StatusInternalServerError, "Error saving media record")
 			}
-			newMedias++
-			newMediaTitles = append(newMediaTitles, media.StoryItem.ShortDescription)
+			if created {
+				newMedias++
+				newMediaTitles = append(newMediaTitles, media.StoryItem.ShortDescription)
 
-			opts.telegram.SendAsync(
-				e.App.Logger(),
-				opts.telegram.Topics.Media,
-				notify.MediaMessage(media.StoryItem.ShortDescription, media.StoryItem.MediaID, data.Player.Nickname),
-			)
-
-			tracked, err := trackMediaUpload(e, data.Player, urlID)
-			if err != nil {
-				return err
+				opts.telegram.SendAsync(
+					e.App.Logger(),
+					opts.telegram.Topics.Media,
+					notify.MediaMessage(media.StoryItem.ShortDescription, media.StoryItem.MediaID, data.Player.Nickname),
+				)
 			}
-			if tracked {
+
+			firstTime, err := ensureUpload(e.App, urlID, playerRecordID, data.Player)
+			if err != nil {
+				return newErrorResponse(e, err, http.StatusInternalServerError, "Error saving media upload record")
+			}
+			if firstTime {
 				firstTimeUserUploads++
 			}
 		}
@@ -220,40 +188,256 @@ func uploadMedia(opts uploadMediaOptions) func(*core.RequestEvent) error {
 	}
 }
 
-// trackMediaUpload stores this agent's upload attempt for the given media
-// unless one is already on record, and reports whether it stored a new one.
-// The returned error is an already-written JSON error response.
-func trackMediaUpload(e *core.RequestEvent, player Player, urlID int) (bool, error) {
-	mediaURLID := fmt.Sprintf("%d", urlID)
+// resolvePlayer hashes the uploading agent's player ID and returns the id of
+// their "players" record, or "" if it could not be determined.
+//
+// The ID is taken from the first item that carries one: every item in a request
+// comes from the same agent's inventory, and no upload session in the
+// production data has ever contained more than one distinct player ID.
+//
+// A missing or unrecognized ID is logged and skipped rather than failing the
+// upload. Media is still worth collecting without attribution, and this way a
+// change to Niantic's ID format degrades to unattributed uploads instead of a
+// hard outage.
+func resolvePlayer(e *core.RequestEvent, hasher *players.Hasher, data UploadMediaRequest) string {
+	for _, media := range data.Medias {
+		raw := media.InInventory.PlayerID
+		if raw == "" {
+			continue
+		}
 
-	// Check if this user has ever uploaded this media before
-	var mediaUploads struct {
-		Count int `db:"count"`
+		hash, err := hasher.Hash(raw)
+		if err != nil {
+			e.App.Logger().WarnContext(e.Request.Context(), "Unrecognized player ID in upload, continuing without attribution",
+				slog.String("player", data.Player.Nickname), slog.Any("error", err))
+			return ""
+		}
+
+		record, err := players.Ensure(e.App, hash, data.Player.Nickname, data.Player.Team)
+		if err != nil {
+			e.App.Logger().ErrorContext(e.Request.Context(), "Failed to resolve player record, continuing without attribution",
+				slog.String("player", data.Player.Nickname), slog.Any("error", err))
+			return ""
+		}
+		return record.Id
 	}
-	if err := e.App.DB().
-		NewQuery("SELECT COUNT(*) count FROM media_uploads WHERE uploader_ign = {:uploader_ign} AND media_url_id = {:media_url_id}").
-		Bind(dbx.Params{
-			"uploader_ign": player.Nickname,
-			"media_url_id": mediaURLID,
-		}).
-		One(&mediaUploads); err != nil {
-		return false, newErrorResponse(e, err, http.StatusInternalServerError, "Error checking media uploads")
+
+	return ""
+}
+
+// claimHistory attaches the agent's earlier, unattributed uploads to the player
+// record this upload just identified, so coverage grows as agents return rather
+// than only from the moment they were first seen.
+//
+// Advisory: a failure or a conflict leaves the upload itself unaffected. The
+// rows it would have linked stay unattributed, and the next upload tries again.
+func claimHistory(e *core.RequestEvent, playerRecordID, nickname string) {
+	result, err := players.ClaimHistory(e.App, playerRecordID, nickname)
+	if err != nil {
+		e.App.Logger().ErrorContext(e.Request.Context(), "Failed to link an agent's earlier uploads",
+			slog.String("player", nickname), slog.Any("error", err))
+		return
 	}
-	if mediaUploads.Count > 0 {
+
+	if result.Conflict {
+		e.App.Logger().WarnContext(e.Request.Context(), "Nickname is already attributed to a different player, left alone",
+			slog.String("player", nickname))
+		return
+	}
+
+	if result.Linked > 0 {
+		e.App.Logger().InfoContext(e.Request.Context(), "Linked an agent's earlier uploads",
+			slog.String("player", nickname), slog.Int("rows", result.Linked))
+	}
+}
+
+// stripPlayerID clears the raw player ID so it never reaches original_data.
+// Takes a copy: the caller's Media is left untouched.
+func stripPlayerID(media Media) Media {
+	media.InInventory.PlayerID = ""
+	return media
+}
+
+// ensureMedia returns the url_id of the "medias" record for this Media,
+// creating it if this is the first time anyone has uploaded it. The bool
+// reports whether it was created.
+func ensureMedia(app core.App, media Media, playerRecordID string, player Player, approved bool) (int, bool, error) {
+	existing, err := app.FindFirstRecordByData("medias", "media_id", media.StoryItem.MediaID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, err
+	}
+	if existing != nil {
+		return existing.GetInt("url_id"), false, nil
+	}
+
+	return createMedia(app, media, playerRecordID, player, approved)
+}
+
+// createMedia inserts a newly discovered Media and returns its freshly minted
+// url_id, or resolves to the existing record if another upload created it first.
+//
+// Split out from ensureMedia's existence check on purpose: that check runs
+// outside the transaction, so two uploads of the same new Media can both pass
+// it. The unique index on media_id is what actually enforces uniqueness - this
+// exists to turn its rejection into the right answer rather than a 500, and to
+// make that recovery testable without having to win a race.
+func createMedia(app core.App, media Media, playerRecordID string, player Player, approved bool) (int, bool, error) {
+	ms, err := strconv.ParseInt(media.StoryItem.ReleaseDate, 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("parsing release date %q: %w", media.StoryItem.ReleaseDate, err)
+	}
+	releaseDate := time.UnixMilli(ms)
+
+	rawMedia, err := json.Marshal(stripPlayerID(media))
+	if err != nil {
+		return 0, false, err
+	}
+
+	collection, err := app.FindCollectionByNameOrId("medias")
+	if err != nil {
+		return 0, false, err
+	}
+
+	var urlID int
+	// The url_id allocation and the insert share a transaction so two uploads
+	// discovering the same new Media at once cannot both read the same MAX and
+	// mint the same public id.
+	err = app.RunInTransaction(func(txApp core.App) error {
+		var maxURLID struct {
+			Max int `db:"max"`
+		}
+		// COALESCE so an empty table yields 0 rather than a NULL that won't scan.
+		if err := txApp.DB().NewQuery("SELECT COALESCE(MAX(url_id), 0) max FROM medias").One(&maxURLID); err != nil {
+			return err
+		}
+		urlID = maxURLID.Max + 1
+
+		record := core.NewRecord(collection)
+		record.Set("url_id", urlID)
+		record.Set("media_id", media.StoryItem.MediaID)
+		record.Set("image_url", media.ImageByURL.ImageURL)
+		record.Set("content_url", media.StoryItem.PrimaryURL)
+		record.Set("short_description", media.StoryItem.ShortDescription)
+		record.Set("description", "")
+		record.Set("released_at", releaseDate)
+		record.Set("uploader_ign", player.Nickname)
+		record.Set("uploader_faction", player.Team)
+		record.Set("original_data", rawMedia)
+		record.Set("level", media.ResourceWithLevels.Level)
+		record.Set("approved", approved)
+		if playerRecordID != "" {
+			record.Set("player", playerRecordID)
+		}
+
+		return txApp.Save(record)
+	})
+	if err != nil {
+		// Rejected by a unique index because another upload created this Media
+		// first. Not an error for this request - the Media exists, it just
+		// wasn't this agent who discovered it - so re-read and carry on to log
+		// their upload.
+		if existing, findErr := app.FindFirstRecordByData("medias", "media_id", media.StoryItem.MediaID); findErr == nil && existing != nil {
+			return existing.GetInt("url_id"), false, nil
+		}
+		return 0, false, err
+	}
+
+	return urlID, true, nil
+}
+
+// ensureUpload records that this agent has uploaded this Media, returning
+// whether it was their first time.
+//
+// Find-or-create, keyed on the player record when the agent is identified and
+// on their nickname when they are not. Identity first is what stops a renamed
+// agent getting a second row for a Media they had already uploaded, which would
+// inflate the upload totals and split them across two names on any
+// ign-grouped leaderboard.
+//
+// A matched row is left exactly as it is. uploader_ign stays frozen at the name
+// used at the time, which is the historical record; players.last_ign carries
+// the current one, and the two together are what let the site offer either.
+func ensureUpload(app core.App, urlID int, playerRecordID string, player Player) (bool, error) {
+	mediaURLID := strconv.Itoa(urlID)
+
+	existing, err := findUpload(app, mediaURLID, playerRecordID, player.Nickname)
+	if err != nil {
+		return false, err
+	}
+
+	if existing != nil {
+		// An older row from before this agent was identified. Linking it here
+		// is what lets ClaimHistory's guard protect them from then on.
+		if playerRecordID != "" && existing.GetString("player") == "" {
+			existing.Set("player", playerRecordID)
+			if err := app.Save(existing); err != nil {
+				return false, err
+			}
+		}
 		return false, nil
 	}
 
-	uploadCollection, err := e.App.FindCollectionByNameOrId("media_uploads")
+	collection, err := app.FindCollectionByNameOrId("media_uploads")
 	if err != nil {
-		return false, newErrorResponse(e, err, http.StatusInternalServerError, "Error finding media uploads collection")
+		return false, err
 	}
-	uploadRecord := core.NewRecord(uploadCollection)
-	uploadRecord.Set("uploader_ign", player.Nickname)
-	uploadRecord.Set("uploader_faction", player.Team)
-	uploadRecord.Set("media_url_id", mediaURLID)
-	if err := e.App.Save(uploadRecord); err != nil {
-		return false, newErrorResponse(e, err, http.StatusInternalServerError, "Error saving media upload record")
+
+	record := core.NewRecord(collection)
+	record.Set("uploader_ign", player.Nickname)
+	record.Set("uploader_faction", player.Team)
+	record.Set("media_url_id", mediaURLID)
+	if playerRecordID != "" {
+		record.Set("player", playerRecordID)
+	}
+
+	if err := app.Save(record); err != nil {
+		// Lost the race on one of the unique indexes - the row we wanted now
+		// exists, so this is not this agent's first upload of it.
+		if found, findErr := findUpload(app, mediaURLID, playerRecordID, player.Nickname); findErr == nil && found != nil {
+			return false, nil
+		}
+		return false, err
 	}
 
 	return true, nil
+}
+
+// findUpload locates this agent's existing row for a Media: by identity when
+// one is known, falling back to the nickname.
+//
+// The fallback is not redundant. Roughly half of media_uploads will never have
+// an identity - agents who only ever uploaded Media someone else had already
+// discovered leave no player ID anywhere - and a returning agent's own older
+// rows are unlinked until this finds them.
+func findUpload(app core.App, mediaURLID, playerRecordID, nickname string) (*core.Record, error) {
+	if playerRecordID != "" {
+		record, err := app.FindFirstRecordByFilter(
+			"media_uploads",
+			"media_url_id = {:media_url_id} && player = {:player}",
+			dbx.Params{"media_url_id": mediaURLID, "player": playerRecordID},
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if record != nil {
+			return record, nil
+		}
+	}
+
+	// An empty nickname matches nobody in particular, so it must not be used
+	// to look one up - it would collide with every other anonymous row.
+	if nickname == "" {
+		return nil, nil
+	}
+
+	record, err := app.FindFirstRecordByFilter(
+		"media_uploads",
+		"media_url_id = {:media_url_id} && uploader_ign = {:uploader_ign}",
+		dbx.Params{"media_url_id": mediaURLID, "uploader_ign": nickname},
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	return record, nil
 }
