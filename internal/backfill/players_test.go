@@ -7,6 +7,7 @@ import (
 	"github.com/dedo1911/ingress-plus-backend/internal/players"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -249,6 +250,95 @@ func TestStripPlayerIDsLeavesScrubMarkersAlone(t *testing.T) {
 
 		if rawPlayerID(stored) != rawPlayerID(c.payload) {
 			t.Errorf("%s: marker was modified, got %s", c.name, stored)
+		}
+	}
+}
+
+// TestRunLinksThinlyEvidencedAgents is the end-to-end check the first two
+// production runs went without: an agent proven by a single plugin-era record
+// must come out linked, with their faction recorded. Both were defects - the
+// old trust threshold withheld 95 medias and 1642 upload rows from agents like
+// this one, and the faction was never written at all.
+func TestRunLinksThinlyEvidencedAgents(t *testing.T) {
+	app, err := tests.NewTestApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Cleanup()
+
+	playersCollection := core.NewBaseCollection(players.CollectionName)
+	playersCollection.Fields.Add(&core.TextField{Name: "player_hash"})
+	playersCollection.Fields.Add(&core.TextField{Name: "last_ign"})
+	playersCollection.Fields.Add(&core.TextField{Name: "last_faction"})
+	playersCollection.AddIndex("idx_players_hash", true, "player_hash", "")
+	if err := app.Save(playersCollection); err != nil {
+		t.Fatal(err)
+	}
+
+	medias := core.NewBaseCollection("medias")
+	medias.Fields.Add(&core.TextField{Name: "uploader_ign"})
+	medias.Fields.Add(&core.TextField{Name: "uploader_faction"})
+	medias.Fields.Add(&core.JSONField{Name: "original_data", MaxSize: 2000000})
+	medias.Fields.Add(&core.RelationField{Name: "player", CollectionId: playersCollection.Id, MaxSelect: 1})
+	// buildMappings reads created to tell plugin-era rows from the legacy import.
+	medias.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
+	if err := app.Save(medias); err != nil {
+		t.Fatal(err)
+	}
+
+	uploads := core.NewBaseCollection("media_uploads")
+	uploads.Fields.Add(&core.TextField{Name: "media_url_id"})
+	uploads.Fields.Add(&core.TextField{Name: "uploader_ign"})
+	uploads.Fields.Add(&core.RelationField{Name: "player", CollectionId: playersCollection.Id, MaxSelect: 1})
+	if err := app.Save(uploads); err != nil {
+		t.Fatal(err)
+	}
+
+	// One plugin-era discovery, which is all the evidence there is for this
+	// agent, plus upload rows that only carry their nickname.
+	media := core.NewRecord(medias)
+	media.Set("uploader_ign", "occasional")
+	media.Set("uploader_faction", "ENLIGHTENED")
+	media.Set("original_data", payload(playerA))
+	if err := app.Save(media); err != nil {
+		t.Fatal(err)
+	}
+	for _, urlID := range []string{"1", "2"} {
+		row := core.NewRecord(uploads)
+		row.Set("media_url_id", urlID)
+		row.Set("uploader_ign", "occasional")
+		if err := app.Save(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := run(app, testHasher(t), false, &cobra.Command{}); err != nil {
+		t.Fatal(err)
+	}
+
+	player, err := app.FindFirstRecordByData(players.CollectionName, "last_ign", "occasional")
+	if err != nil {
+		t.Fatalf("no players record was created for a single-record agent: %v", err)
+	}
+	if got := player.GetString("last_faction"); got != "ENLIGHTENED" {
+		t.Fatalf("last_faction = %q, want ENLIGHTENED", got)
+	}
+
+	linked, err := app.FindRecordById("medias", media.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := linked.GetString("player"); got != player.Id {
+		t.Fatalf("medias.player = %q, want %q", got, player.Id)
+	}
+
+	rows, err := app.FindAllRecords("media_uploads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if got := row.GetString("player"); got != player.Id {
+			t.Fatalf("media_uploads row %s left unlinked: player = %q", row.Id, got)
 		}
 	}
 }
