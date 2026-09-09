@@ -572,9 +572,47 @@ func TestPlaceholderUsernameFallsBackWhenTheIdIsTaken(t *testing.T) {
 	}
 }
 
-func TestConfirmWorksAfterTheCodeHasExpired(t *testing.T) {
+func TestCommDeadlineGivesTheAdminsAWeek(t *testing.T) {
 	app := newTestApp(t)
 	user := newUser(t, app, "oscarc1", "resistance", "")
+
+	v, err := Mint(app, user, TierAdvanced, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The 30 minute TTL bounds the agent pasting the code in. Once the plext is
+	// in COMM the clock belongs to the admins, who read the feed whenever they
+	// get to it - the claim route stamps this on the record.
+	deadline := CommDeadline()
+	if left := time.Until(deadline.Time()); left < 6*24*time.Hour || left > 8*24*time.Hour {
+		t.Fatalf("CommDeadline is %v away, want about a week", left)
+	}
+
+	if _, err := Consume(app, v.GetString("code"), StatusPending, StatusClaimed); err != nil {
+		t.Fatal(err)
+	}
+	v, err = app.FindFirstRecordByData(CollectionName, "code", v.GetString("code"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Set("expires_at", deadline)
+	if err := app.Save(v); err != nil {
+		t.Fatal(err)
+	}
+
+	confirmed, err := Consume(app, v.GetString("code"), StatusClaimed, StatusConfirmed)
+	if err != nil {
+		t.Fatalf("confirming inside the window: %v", err)
+	}
+	if Status(confirmed.GetString("status")) != StatusConfirmed {
+		t.Fatalf("status = %q, want %q", confirmed.GetString("status"), StatusConfirmed)
+	}
+}
+
+func TestConfirmingAfterTheWindowIsRefused(t *testing.T) {
+	app := newTestApp(t)
+	user := newUser(t, app, "latecomer", "resistance", "")
 
 	v, err := Mint(app, user, TierAdvanced, false, "")
 	if err != nil {
@@ -584,29 +622,19 @@ func TestConfirmWorksAfterTheCodeHasExpired(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Nobody watches Point Nemo continuously, so an admin reading the plext
-	// hours later is the normal case, not an edge one. The TTL bounds the
-	// agent, not the admin.
 	v, err = app.FindFirstRecordByData(CollectionName, "code", v.GetString("code"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	v.Set("expires_at", types.NowDateTime().Add(-time.Hour))
+	v.Set("expires_at", types.NowDateTime().Add(-time.Second))
 	if err := app.Save(v); err != nil {
 		t.Fatal(err)
 	}
 
-	confirmed, err := Confirm(app, v.GetString("code"))
-	if err != nil {
-		t.Fatalf("Confirm on an expired code: %v", err)
-	}
-	if Status(confirmed.GetString("status")) != StatusConfirmed {
-		t.Fatalf("status = %q, want %q", confirmed.GetString("status"), StatusConfirmed)
-	}
-
-	// Still single use.
-	if _, err := Confirm(app, v.GetString("code")); !errors.Is(err, ErrCodeUnusable) {
-		t.Fatalf("second Confirm error = %v, want ErrCodeUnusable", err)
+	// A verification nobody confirmed lapses rather than staying claimable
+	// forever. The agent can mint a new code and post again.
+	if _, err := Consume(app, v.GetString("code"), StatusClaimed, StatusConfirmed); !errors.Is(err, ErrCodeUnusable) {
+		t.Fatalf("error = %v, want ErrCodeUnusable", err)
 	}
 }
 

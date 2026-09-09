@@ -65,7 +65,7 @@ deliberately no cleanup cron.
 | `status` | select `pending\|claimed\|confirmed\|applied\|rejected` | yes | target of the atomic single-use UPDATE |
 | `contested` | bool | no | the agent asserted the name is theirs although another account holds it |
 | `claimed_username` | text | no | set at mint when contested: their profile cannot hold the name yet |
-| `expires_at` | date | yes | 30-minute TTL |
+| `expires_at` | date | yes | 30 minutes to redeem the code, then **extended to 7 days** when it is claimed for COMM |
 | `nickname`, `faction` | text | no | what was attested — written at claim, **overwritten from COMM at confirm** |
 | `player_hash` | text, **hidden** | no | the strong tier's proof artifact. Not unique: an agent may re-verify |
 | `claimed_at`, `confirmed_at` | date | no | audit |
@@ -79,6 +79,15 @@ API rules:
   `players`. The Go code writes through `app.Save`, which bypasses rules.
 
 Indexes: unique on `code`; plain on `(user, status)`.
+
+### Two clocks
+
+A code lives 30 minutes, which is how long an agent needs to paste it into
+the plugin. Claiming it for advanced or strong resets `expires_at` to a week
+out: once the plext is in COMM the clock belongs to the admins, and nobody
+watches Point Nemo continuously. It stays a deadline rather than becoming no
+expiry at all so a verification nobody confirms lapses instead of staying
+claimable forever - the agent can always mint a new code and post again.
 
 ## 2. The `players.user` unique index
 
@@ -97,6 +106,8 @@ instead of silently duplicating an identity.
 ## 3. Environment and the feature flag
 
 `TELEGRAM_TOPIC_VERIFICATION` — the forum topic for verification notifications.
+These go to the **admin group only** and are the queue of verifications waiting
+to be confirmed; nothing about them reaches the agent, who is emailed instead.
 Optional; unset posts to the group's General thread, and with no bot token every
 send is a no-op like the rest of `internal/notify`.
 

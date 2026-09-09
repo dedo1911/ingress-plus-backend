@@ -125,6 +125,12 @@ func ClaimVerification(telegram *notify.Telegram, hasher *players.Hasher) func(*
 		claimed.Set("faction", data.Faction)
 		claimed.Set("player_hash", hash)
 		claimed.Set("claimed_at", types.NowDateTime())
+		if tier.Proves() {
+			// The clock now belongs to the admins: the 30 minutes bounded how
+			// long the agent had to paste the code in, and from here it is a
+			// week to read the plext out of COMM.
+			claimed.Set("expires_at", verification.CommDeadline())
+		}
 		if err := e.App.Save(claimed); err != nil {
 			return newErrorResponse(e, err, http.StatusInternalServerError, "Could not record the verification attempt")
 		}
@@ -132,9 +138,14 @@ func ClaimVerification(telegram *notify.Telegram, hasher *players.Hasher) func(*
 		if tier.Proves() {
 			comm := verification.CommTarget(data.Code)
 
+			// Admins only - this is the queue telling them there is something
+			// to confirm. Nothing here is sent to the agent; what they need to
+			// hear goes by email, from applyVerification and notifyMismatch.
 			telegram.SendAsync(e.App.Logger(), telegram.Topics.Verification, notify.VerificationMessage(
-				"Verification waiting for COMM", data.Nickname,
-				"Level: "+string(tier), "Code: "+data.Code,
+				"Verification pending - confirm it in COMM", data.Nickname,
+				"Level: "+string(tier),
+				"Code: "+data.Code,
+				"Confirm by: "+claimed.GetDateTime("expires_at").Time().UTC().Format("2006-01-02 15:04")+" UTC",
 			))
 
 			return e.JSON(http.StatusOK, map[string]any{
@@ -184,7 +195,9 @@ func ConfirmVerification(telegram *notify.Telegram) func(*core.RequestEvent) err
 
 		// No feature-flag check here: an admin has to be able to finish a
 		// verification that is already sitting in COMM after the flag goes off.
-		record, err := verification.Confirm(e.App, e.Request.PathValue("code"))
+		// The deadline still applies - claim extended it to a week.
+		record, err := verification.Consume(e.App, e.Request.PathValue("code"),
+			verification.StatusClaimed, verification.StatusConfirmed)
 		if err != nil {
 			return verificationFailure(e, err)
 		}

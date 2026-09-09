@@ -182,6 +182,12 @@ func Message(label, value string) string {
 }
 
 // VerificationMessage formats a notification from the agent verification flow.
+//
+// Like every other Telegram notification here it goes to the admin group and
+// never to the agent it is about: it is the admins' queue, telling them a
+// verification is waiting to be confirmed. Anything the agent needs to hear is
+// sent by email instead.
+//
 // The lines are free text rather than a fixed shape because the three cases it
 // covers - a code waiting in COMM, a tier applied, a username taken off another
 // account - have nothing in common beyond the agent they concern.

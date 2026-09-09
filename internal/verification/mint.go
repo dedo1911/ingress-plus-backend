@@ -26,9 +26,17 @@ const (
 	codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 	// codeTTL is deliberately short. A code is only in the agent's hands for
-	// as long as it takes to paste it into the plugin; the admin half of the
-	// flow works off the record, not the clock.
+	// as long as it takes to paste it into the plugin.
 	codeTTL = 30 * time.Minute
+
+	// commTTL is how long the admins then have. Once the plext is in COMM the
+	// clock stops being the agent's - nobody watches Point Nemo continuously,
+	// so a code that died 30 minutes after minting could never be confirmed by
+	// a human reading the feed later in the week.
+	//
+	// It is a deadline rather than no expiry at all so an unconfirmed
+	// verification eventually lapses instead of staying claimable forever.
+	commTTL = 7 * 24 * time.Hour
 )
 
 var (
@@ -142,33 +150,15 @@ func findPending(app core.App, userID string, tier Tier, contested bool, claimed
 // pass the check. Expiry is in the WHERE clause for the same reason - checking
 // it beforehand leaves a window.
 func Consume(app core.App, code string, from, to Status) (*core.Record, error) {
-	return consume(app, code, from, to, true)
-}
-
-// Confirm records that an admin read the code out of COMM.
-//
-// It skips the expiry check on purpose. The TTL bounds how long the agent has
-// to redeem a code, not how long an admin has to notice the plext - which may
-// be hours or days later, since nobody is watching Point Nemo continuously. The
-// plext is the proof and it does not go stale; the status transition is what
-// keeps it single-use.
-func Confirm(app core.App, code string) (*core.Record, error) {
-	return consume(app, code, StatusClaimed, StatusConfirmed, false)
-}
-
-func consume(app core.App, code string, from, to Status, enforceExpiry bool) (*core.Record, error) {
-	query := "UPDATE " + CollectionName + " SET status = {:to} WHERE code = {:code} AND status = {:from}"
-	params := dbx.Params{
-		"to":   string(to),
-		"code": code,
-		"from": string(from),
-	}
-	if enforceExpiry {
-		query += " AND expires_at > {:now}"
-		params["now"] = types.NowDateTime()
-	}
-
-	result, err := app.DB().NewQuery(query).Bind(params).Execute()
+	result, err := app.DB().
+		NewQuery("UPDATE " + CollectionName + " SET status = {:to} WHERE code = {:code} AND status = {:from} AND expires_at > {:now}").
+		Bind(dbx.Params{
+			"to":   string(to),
+			"code": code,
+			"from": string(from),
+			"now":  types.NowDateTime(),
+		}).
+		Execute()
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +177,13 @@ func consume(app core.App, code string, from, to Status, enforceExpiry bool) (*c
 	}
 
 	return record, nil
+}
+
+// CommDeadline is when a code that has been posted to COMM stops being
+// confirmable. The claim route stamps it on the record for the tiers that go
+// via COMM, handing the remaining time to the admins.
+func CommDeadline() types.DateTime {
+	return types.NowDateTime().Add(commTTL)
 }
 
 // FindUsableCode returns the record for a code that is still pending and
