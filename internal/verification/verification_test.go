@@ -571,3 +571,92 @@ func TestPlaceholderUsernameFallsBackWhenTheIdIsTaken(t *testing.T) {
 		t.Fatalf("fallback placeholder %q is not a username the field would accept", got)
 	}
 }
+
+func TestConfirmWorksAfterTheCodeHasExpired(t *testing.T) {
+	app := newTestApp(t)
+	user := newUser(t, app, "oscarc1", "resistance", "")
+
+	v, err := Mint(app, user, TierAdvanced, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Consume(app, v.GetString("code"), StatusPending, StatusClaimed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nobody watches Point Nemo continuously, so an admin reading the plext
+	// hours later is the normal case, not an edge one. The TTL bounds the
+	// agent, not the admin.
+	v, err = app.FindFirstRecordByData(CollectionName, "code", v.GetString("code"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Set("expires_at", types.NowDateTime().Add(-time.Hour))
+	if err := app.Save(v); err != nil {
+		t.Fatal(err)
+	}
+
+	confirmed, err := Confirm(app, v.GetString("code"))
+	if err != nil {
+		t.Fatalf("Confirm on an expired code: %v", err)
+	}
+	if Status(confirmed.GetString("status")) != StatusConfirmed {
+		t.Fatalf("status = %q, want %q", confirmed.GetString("status"), StatusConfirmed)
+	}
+
+	// Still single use.
+	if _, err := Confirm(app, v.GetString("code")); !errors.Is(err, ErrCodeUnusable) {
+		t.Fatalf("second Confirm error = %v, want ErrCodeUnusable", err)
+	}
+}
+
+func TestCommTargetIsWhatTheAdminToolingLooksFor(t *testing.T) {
+	app := newTestApp(t)
+	user := newUser(t, app, "oscarc1", "resistance", "")
+
+	v, err := Mint(app, user, TierAdvanced, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	comm := CommTarget(v.GetString("code"))
+	// A real plext as the admin plugin sees it: a nickname, then the message.
+	plext := "<oscarc1> " + comm.Message
+
+	if got := CommPattern.FindString(plext); got != comm.Message {
+		t.Fatalf("CommPattern found %q in %q, want %q", got, plext, comm.Message)
+	}
+	if comm.LatE6 != -48876667 || comm.LngE6 != -123393333 {
+		t.Fatalf("coordinates = %d,%d, want Point Nemo", comm.LatE6, comm.LngE6)
+	}
+}
+
+func TestEnabledFailsClosed(t *testing.T) {
+	app := newTestApp(t)
+
+	// No feature_flags collection at all: the flag cannot be read, so the flow
+	// is closed rather than open.
+	if Enabled(app) {
+		t.Fatal("Enabled reported true with no flag to read")
+	}
+
+	flags := core.NewBaseCollection("feature_flags")
+	flags.Fields.Add(&core.TextField{Name: "name"})
+	flags.Fields.Add(&core.BoolField{Name: "enabled"})
+	if err := app.Save(flags); err != nil {
+		t.Fatal(err)
+	}
+	if Enabled(app) {
+		t.Fatal("Enabled reported true with no record")
+	}
+
+	record := core.NewRecord(flags)
+	record.Set("name", FlagName)
+	record.Set("enabled", true)
+	if err := app.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if !Enabled(app) {
+		t.Fatal("Enabled reported false with the flag on")
+	}
+}

@@ -142,15 +142,33 @@ func findPending(app core.App, userID string, tier Tier, contested bool, claimed
 // pass the check. Expiry is in the WHERE clause for the same reason - checking
 // it beforehand leaves a window.
 func Consume(app core.App, code string, from, to Status) (*core.Record, error) {
-	result, err := app.DB().
-		NewQuery("UPDATE " + CollectionName + " SET status = {:to} WHERE code = {:code} AND status = {:from} AND expires_at > {:now}").
-		Bind(dbx.Params{
-			"to":   string(to),
-			"code": code,
-			"from": string(from),
-			"now":  types.NowDateTime(),
-		}).
-		Execute()
+	return consume(app, code, from, to, true)
+}
+
+// Confirm records that an admin read the code out of COMM.
+//
+// It skips the expiry check on purpose. The TTL bounds how long the agent has
+// to redeem a code, not how long an admin has to notice the plext - which may
+// be hours or days later, since nobody is watching Point Nemo continuously. The
+// plext is the proof and it does not go stale; the status transition is what
+// keeps it single-use.
+func Confirm(app core.App, code string) (*core.Record, error) {
+	return consume(app, code, StatusClaimed, StatusConfirmed, false)
+}
+
+func consume(app core.App, code string, from, to Status, enforceExpiry bool) (*core.Record, error) {
+	query := "UPDATE " + CollectionName + " SET status = {:to} WHERE code = {:code} AND status = {:from}"
+	params := dbx.Params{
+		"to":   string(to),
+		"code": code,
+		"from": string(from),
+	}
+	if enforceExpiry {
+		query += " AND expires_at > {:now}"
+		params["now"] = types.NowDateTime()
+	}
+
+	result, err := app.DB().NewQuery(query).Bind(params).Execute()
 	if err != nil {
 		return nil, err
 	}

@@ -29,9 +29,10 @@ const (
 // (message thread) it belongs to, mirroring the message_thread_id values
 // the old pb_hooks/telegram.pb.js had hardcoded in its URLs.
 type Topics struct {
-	Badges     int64
-	BugReports int64
-	Media      int64
+	Badges       int64
+	BugReports   int64
+	Media        int64
+	Verification int64
 }
 
 // Telegram posts short HTML notifications into the topics of a single
@@ -63,9 +64,10 @@ func TelegramFromEnv() *Telegram {
 		Token:  os.Getenv("TELEGRAM_BOT_TOKEN"),
 		ChatID: os.Getenv("TELEGRAM_CHAT_ID"),
 		Topics: Topics{
-			Badges:     envInt64("TELEGRAM_TOPIC_BADGES"),
-			BugReports: envInt64("TELEGRAM_TOPIC_BUG_REPORTS"),
-			Media:      envInt64("TELEGRAM_TOPIC_MEDIA"),
+			Badges:       envInt64("TELEGRAM_TOPIC_BADGES"),
+			BugReports:   envInt64("TELEGRAM_TOPIC_BUG_REPORTS"),
+			Media:        envInt64("TELEGRAM_TOPIC_MEDIA"),
+			Verification: envInt64("TELEGRAM_TOPIC_VERIFICATION"),
 		},
 	}
 }
@@ -177,6 +179,18 @@ func (t *Telegram) redact(s string) string {
 // whole message.
 func Message(label, value string) string {
 	return "<b>" + html.EscapeString(label) + ":</b> " + html.EscapeString(value)
+}
+
+// VerificationMessage formats a notification from the agent verification flow.
+// The lines are free text rather than a fixed shape because the three cases it
+// covers - a code waiting in COMM, a tier applied, a username taken off another
+// account - have nothing in common beyond the agent they concern.
+func VerificationMessage(headline, agent string, lines ...string) string {
+	text := "<b>" + html.EscapeString(headline) + "</b>\nAgent: " + html.EscapeString(agent)
+	for _, line := range lines {
+		text += "\n" + html.EscapeString(line)
+	}
+	return text
 }
 
 // MediaMessage formats the new-media notification sent on upload.
