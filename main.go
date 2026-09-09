@@ -44,6 +44,10 @@ func main() {
 	// back to "queued"/"draft" and cause the cron to re-send it.
 	app.OnRecordUpdateRequest("email_campaigns").BindFunc(campaigns.GuardCampaignUpdateRequest)
 
+	// An agent can clear their own verification; their Ingress identity has to
+	// go with it.
+	app.OnRecordUpdateRequest("users").BindFunc(players.UnlinkOnUnverifyRequest)
+
 	// Telegram notifications for badge and bug report changes
 	notify.RegisterHooks(app, telegram)
 
