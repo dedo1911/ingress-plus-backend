@@ -39,6 +39,14 @@ API rules:
 - Create / Update / Delete: **empty (superusers only)**. The Go code writes
   through `app.Save`, which bypasses collection rules.
 
+Add a **partial** unique index on `user` when the verification flow ships —
+nothing else stops two accounts owning one Ingress identity:
+
+    CREATE UNIQUE INDEX idx_players_user ON players (user) WHERE user != ''
+
+Partial for the same reason as `idx_media_uploads_player` below. See
+[agent-verification.md](agent-verification.md), which owns that flow.
+
 ## 3. Relations on the existing collections
 
 Add to **both** `medias` and `media_uploads`:

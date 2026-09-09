@@ -219,6 +219,13 @@ func resolvePlayer(e *core.RequestEvent, hasher *players.Hasher, data UploadMedi
 				slog.String("player", data.Player.Nickname), slog.Any("error", err))
 			return ""
 		}
+		// Advisory: an advanced verification carries no hash, so a nickname
+		// match here is the only way its account ever reaches this row.
+		if err := players.LinkVerifiedUser(e.App, record); err != nil {
+			e.App.Logger().WarnContext(e.Request.Context(), "Failed to link a verified account to its player record",
+				slog.String("player", data.Player.Nickname), slog.Any("error", err))
+		}
+
 		return record.Id
 	}
 

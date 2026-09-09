@@ -34,6 +34,12 @@ func main() {
 		// updated to v2 (see routes.UploadMediaV1 for the differences).
 		se.Router.POST("/api/mediagress/v1/upload-media", routes.UploadMediaV1(telegram, hasher))
 		se.Router.POST("/api/mediagress/v2/upload-media", routes.UploadMediaV2(telegram, hasher))
+		// The claim route is unauthenticated for the same reason the upload
+		// route is: the plugin has no Ingress Plus session. The code it carries
+		// is what identifies the account.
+		se.Router.POST("/api/verification/mint", routes.MintVerification).Bind(apis.RequireAuth("users"))
+		se.Router.POST("/api/verification/claim", routes.ClaimVerification(telegram, hasher))
+		se.Router.POST("/api/admin/verification/{code}/confirm", routes.ConfirmVerification(telegram)).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/send-test", routes.SendTestCampaign).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/preview-count", routes.PreviewAudienceCount).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/{id}/dispatch", routes.DispatchCampaignNow).Bind(apis.RequireSuperuserAuth())
@@ -43,6 +49,10 @@ func main() {
 	// Block REST updates that would flip an already-sent/sending campaign
 	// back to "queued"/"draft" and cause the cron to re-send it.
 	app.OnRecordUpdateRequest("email_campaigns").BindFunc(campaigns.GuardCampaignUpdateRequest)
+
+	// An agent can clear their own verification; their Ingress identity has to
+	// go with it.
+	app.OnRecordUpdateRequest("users").BindFunc(players.UnlinkOnUnverifyRequest)
 
 	// Telegram notifications for badge and bug report changes
 	notify.RegisterHooks(app, telegram)

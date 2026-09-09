@@ -25,11 +25,21 @@ func newTestApp(t *testing.T) *tests.TestApp {
 	}
 	t.Cleanup(app.Cleanup)
 
+	users, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	playersCollection := core.NewBaseCollection(players.CollectionName)
 	playersCollection.Fields.Add(&core.TextField{Name: "player_hash"})
 	playersCollection.Fields.Add(&core.TextField{Name: "last_ign"})
 	playersCollection.Fields.Add(&core.TextField{Name: "last_faction"})
+	playersCollection.Fields.Add(&core.RelationField{Name: "user", CollectionId: users.Id, MaxSelect: 1})
+	playersCollection.Fields.Add(&core.DateField{Name: "verified_at"})
 	playersCollection.AddIndex("idx_players_hash", true, "player_hash", "")
+	// Partial for the same reason as media_uploads: an unset relation is
+	// stored as an empty string, and most rows have no verified owner.
+	playersCollection.AddIndex("idx_players_user", true, "user", "user != ''")
 	if err := app.Save(playersCollection); err != nil {
 		t.Fatalf("creating players collection: %v", err)
 	}
