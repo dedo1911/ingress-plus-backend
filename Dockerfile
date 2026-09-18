@@ -9,10 +9,19 @@
 # so this pin can go once we upgrade PocketBase.
 FROM golang:1.25 AS build
 WORKDIR /app
+# Modules first, so a source change doesn't invalidate the download layer.
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN GOOS=linux GOARCH=amd64 go build -trimpath -o ingress-plus
+RUN GOOS=linux GOARCH=amd64 go build -trimpath -o ingress-plus && mkdir -p /app/pb_data
 
 FROM gcr.io/distroless/base:latest
 WORKDIR /app
-COPY --from=build /app/ingress-plus .
+# Same non-root uid as the website image. PocketBase writes ./pb_data, so
+# the directory ships pre-created and owned by that uid for local runs; a
+# volume mounted over it must be writable by 65532 too (fsGroup on the
+# Deployment).
+COPY --from=build --chown=65532:65532 /app/ingress-plus /app/ingress-plus
+COPY --from=build --chown=65532:65532 /app/pb_data /app/pb_data
+USER 65532:65532
 CMD ["/app/ingress-plus"]
