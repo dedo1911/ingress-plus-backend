@@ -53,7 +53,9 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 		}
 		stats := new(Stats)
 		if err := app.DB().NewQuery(`SELECT
-		(SELECT MAX(media_id) FROM medias) AS max_media_id,
+		-- media_id is a text column: a plain MAX is lexicographic and "9999" beats
+		-- "10000" the day Niantic issues a five-digit id.
+		(SELECT MAX(CAST(media_id AS INTEGER)) FROM medias) AS max_media_id,
 		(SELECT MAX(created) FROM users LIMIT 1) AS user_last_created,
 		(SELECT COUNT(DISTINCT uploader_ign) FROM media_uploads) AS unique_media_contributors,
 		(SELECT COUNT(DISTINCT uploader_ign) FROM medias) AS unique_new_media_contributors`).
