@@ -16,7 +16,7 @@ const testPlayerID = "cb3773292130450080439d75cdcff215.c"
 // newTestApp builds the three collections the upload path touches. Their shapes
 // mirror production closely enough for the behaviour under test; the live
 // schema lives in PocketBase, not in this repo.
-func newTestApp(t *testing.T) *tests.TestApp {
+func newTestApp(t testing.TB) *tests.TestApp {
 	t.Helper()
 
 	app, err := tests.NewTestApp()
