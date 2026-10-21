@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
 )
 
@@ -32,6 +33,11 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 			app.Logger().Error("Failed to count user_badges", "error", err)
 			return
 		}
+		totalWings, err := app.CountRecords("user_badges", dbx.HashExp{"hasWings": true})
+		if err != nil {
+			app.Logger().Error("Failed to count wings", "error", err)
+			return
+		}
 		totalUsers, err := app.CountRecords("users")
 		if err != nil {
 			app.Logger().Error("Failed to count users", "error", err)
@@ -61,6 +67,7 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 		record.Set("total_media", totalMedia)
 		record.Set("total_media_uploads", totalMediaUploads)
 		record.Set("total_owned_badges", totalOwnedBadges)
+		record.Set("total_wings", totalWings)
 		record.Set("total_users", totalUsers)
 		record.Set("estimate_total_media", stats.MaxMediaID)
 		record.Set("unique_media_contributors", stats.UniqueMediaContributors)
