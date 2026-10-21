@@ -34,6 +34,7 @@ func main() {
 		// updated to v2 (see routes.UploadMediaV1 for the differences).
 		se.Router.POST("/api/mediagress/v1/upload-media", routes.UploadMediaV1(telegram, hasher))
 		se.Router.POST("/api/mediagress/v2/upload-media", routes.UploadMediaV2(telegram, hasher))
+		se.Router.POST("/api/mu-calc", routes.MuCalc)
 		se.Router.POST("/api/admin/campaigns/send-test", routes.SendTestCampaign).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/preview-count", routes.PreviewAudienceCount).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/{id}/dispatch", routes.DispatchCampaignNow).Bind(apis.RequireSuperuserAuth())
