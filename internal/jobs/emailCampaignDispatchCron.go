@@ -3,7 +3,6 @@ package jobs
 import (
 	"database/sql"
 	"errors"
-	"log"
 
 	"github.com/dedo1911/ingress-plus-backend/internal/campaigns"
 	"github.com/pocketbase/dbx"
@@ -25,7 +24,6 @@ func EmailCampaignDispatchCron(app *pocketbase.PocketBase) func() {
 			campaign, err := app.FindFirstRecordByFilter("email_campaigns", "status = {:status}", dbx.Params{"status": "queued"})
 			if err != nil {
 				if !errors.Is(err, sql.ErrNoRows) {
-					log.Println("Failed to query queued email campaigns", err)
 					app.Logger().Error("Failed to query queued email campaigns", "error", err)
 				}
 				return
@@ -37,7 +35,6 @@ func EmailCampaignDispatchCron(app *pocketbase.PocketBase) func() {
 				// still "queued", so continuing would re-query the same record
 				// and spin hot for as long as the DB keeps erroring. The next
 				// tick retries in a few minutes.
-				log.Println("Failed to claim campaign", campaign.Id, err)
 				app.Logger().Error("Failed to claim campaign", "id", campaign.Id, "error", err)
 				return
 			}
@@ -48,7 +45,6 @@ func EmailCampaignDispatchCron(app *pocketbase.PocketBase) func() {
 			}
 
 			if err := campaigns.DispatchCampaign(app, campaign); err != nil {
-				log.Println("Failed to dispatch campaign", campaign.Id, err)
 				app.Logger().Error("Failed to dispatch campaign", "id", campaign.Id, "error", err)
 			}
 		}

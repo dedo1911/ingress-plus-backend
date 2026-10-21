@@ -1,8 +1,7 @@
 package jobs
 
 import (
-	"log"
-
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
 )
 
@@ -16,31 +15,31 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 
 		totalBadges, err := app.CountRecords("badges")
 		if err != nil {
-			log.Println("Failed to count badges", err)
 			app.Logger().Error("Failed to count badges", "error", err)
 			return
 		}
 		totalMedia, err := app.CountRecords("medias")
 		if err != nil {
-			log.Println("Failed to count medias", err)
 			app.Logger().Error("Failed to count medias", "error", err)
 			return
 		}
 		totalMediaUploads, err := app.CountRecords("media_uploads")
 		if err != nil {
-			log.Println("Failed to count media_uploads", err)
 			app.Logger().Error("Failed to count media_uploads", "error", err)
 			return
 		}
 		totalOwnedBadges, err := app.CountRecords("user_badges")
 		if err != nil {
-			log.Println("Failed to count user_badges", err)
 			app.Logger().Error("Failed to count user_badges", "error", err)
+			return
+		}
+		totalWings, err := app.CountRecords("user_badges", dbx.HashExp{"hasWings": true})
+		if err != nil {
+			app.Logger().Error("Failed to count wings", "error", err)
 			return
 		}
 		totalUsers, err := app.CountRecords("users")
 		if err != nil {
-			log.Println("Failed to count users", err)
 			app.Logger().Error("Failed to count users", "error", err)
 			return
 		}
@@ -53,12 +52,13 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 		}
 		stats := new(Stats)
 		if err := app.DB().NewQuery(`SELECT
-		(SELECT MAX(media_id) FROM medias) AS max_media_id,
-		(SELECT MAX(created) FROM users LIMIT 1) AS user_last_created,
+		-- media_id is a text column: a plain MAX is lexicographic and "9999" beats
+		-- "10000" the day Niantic issues a five-digit id.
+		(SELECT MAX(CAST(media_id AS INTEGER)) FROM medias) AS max_media_id,
+		(SELECT MAX(created) FROM users) AS user_last_created,
 		(SELECT COUNT(DISTINCT uploader_ign) FROM media_uploads) AS unique_media_contributors,
 		(SELECT COUNT(DISTINCT uploader_ign) FROM medias) AS unique_new_media_contributors`).
 			One(&stats); err != nil {
-			log.Println("Failed to query stats", err)
 			app.Logger().Error("Failed to query stats", "error", err)
 			return
 		}
@@ -67,6 +67,7 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 		record.Set("total_media", totalMedia)
 		record.Set("total_media_uploads", totalMediaUploads)
 		record.Set("total_owned_badges", totalOwnedBadges)
+		record.Set("total_wings", totalWings)
 		record.Set("total_users", totalUsers)
 		record.Set("estimate_total_media", stats.MaxMediaID)
 		record.Set("unique_media_contributors", stats.UniqueMediaContributors)
@@ -74,7 +75,6 @@ func StatisticsUpdateCron(app *pocketbase.PocketBase) func() {
 		record.Set("user_last_created", stats.UserLastCreated)
 
 		if err := app.Save(record); err != nil {
-			log.Println("Failed to save statistics record", err)
 			app.Logger().Error("Failed to save statistics record", "error", err)
 			return
 		}

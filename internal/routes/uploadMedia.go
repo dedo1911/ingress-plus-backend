@@ -64,6 +64,12 @@ type UploadMediaRequest struct {
 	Medias []Media `json:"medias"`
 }
 
+// maxUploadBodyBytes caps the unauthenticated upload body. A full C.O.R.E.
+// inventory is a few hundred Media at well under 1 KB each, so this is over
+// an order of magnitude of headroom; without a cap one POST allocates
+// whatever the sender feels like sending.
+const maxUploadBodyBytes = 4 << 20
+
 // uploadMediaOptions carries the deliberate behaviour differences between
 // the two versions of the endpoint. v1 is frozen: it has to keep matching
 // what pb_hooks/mediagress.pb.js did, because clients too old to be
@@ -131,13 +137,23 @@ func UploadMediaV2(telegram *notify.Telegram, hasher *players.Hasher) func(*core
 func uploadMedia(opts uploadMediaOptions) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		defer e.Request.Body.Close()
-		body, err := io.ReadAll(e.Request.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(e.Response, e.Request.Body, maxUploadBodyBytes))
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return newErrorResponse(e, err, http.StatusRequestEntityTooLarge, "Request body too large")
+			}
 			return newErrorResponse(e, err, http.StatusInternalServerError, "Failed to read request body")
 		}
 		var data UploadMediaRequest
 		if err := json.Unmarshal(body, &data); err != nil {
 			return newErrorResponse(e, err, http.StatusBadRequest, "Invalid JSON format")
+		}
+		// The plugin sends IITC's global PLAYER as-is; if that isn't populated
+		// there is nothing to attribute the upload to, and findUpload can't key
+		// an anonymous row on an empty name either.
+		if data.Player.Nickname == "" {
+			return newErrorResponse(e, errors.New("player.nickname is empty"), http.StatusBadRequest, "Missing player nickname")
 		}
 
 		e.App.Logger().DebugContext(e.Request.Context(), "Received upload media request", slog.String("player", data.Player.Nickname))
