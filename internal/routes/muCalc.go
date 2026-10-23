@@ -3,6 +3,7 @@ package routes
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,6 +20,7 @@ const (
 	muCalcDefaultAPIBaseURL = "https://api.declassified.rocks"
 	muCalcMaxRequestBytes   = 64 << 10
 	muCalcMaxFields         = 50
+	muCalcMaxNameLength     = 200
 )
 
 type muCalcField struct {
@@ -29,38 +31,52 @@ type muCalcField struct {
 // MuCalc proxies the documented Declassified bulk MU operation. Keeping this
 // call in the API backend means the browser uses one stable Ingress Plus route;
 // MU_CALC_API_BASE_URL can switch its upstream when we host the calculation.
+// The upstream sees this server's IP, not the user's, so per-user throttling
+// has to happen here: a PocketBase rate-limit rule on "POST /api/mu-calc".
 func MuCalc(e *core.RequestEvent) error {
+	badRequest := func(msg string) error {
+		return newErrorResponse(e, errors.New(msg), http.StatusBadRequest, msg)
+	}
+
 	body, err := io.ReadAll(io.LimitReader(e.Request.Body, muCalcMaxRequestBytes+1))
 	if err != nil {
-		return e.JSON(http.StatusBadRequest, map[string]string{"error": "Could not read the request body."})
+		return badRequest("Could not read the request body.")
 	}
 	if len(body) > muCalcMaxRequestBytes {
-		return e.JSON(http.StatusRequestEntityTooLarge, map[string]string{"error": "Request body is too large."})
+		return newErrorResponse(e, errors.New("body over limit"), http.StatusRequestEntityTooLarge, "Request body is too large.")
 	}
 
 	var fields []muCalcField
 	if err := json.Unmarshal(body, &fields); err != nil {
-		return e.JSON(http.StatusBadRequest, map[string]string{"error": "Request body must be a JSON array of fields."})
+		return badRequest("Request body must be a JSON array of fields.")
 	}
 	if len(fields) == 0 || len(fields) > muCalcMaxFields {
-		return e.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("Submit between 1 and %d fields.", muCalcMaxFields)})
+		return badRequest(fmt.Sprintf("Submit between 1 and %d fields.", muCalcMaxFields))
 	}
 	for fieldIndex, field := range fields {
 		if len(field.Coordinates) != 3 {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("Field %d: supply exactly three coordinates.", fieldIndex+1)})
+			return badRequest(fmt.Sprintf("Field %d: supply exactly three coordinates.", fieldIndex+1))
 		}
-		if len(field.Name) > 200 {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("Field %d: name must be 200 characters or fewer.", fieldIndex+1)})
+		if len(field.Name) > muCalcMaxNameLength {
+			return badRequest(fmt.Sprintf("Field %d: name must be %d characters or fewer.", fieldIndex+1, muCalcMaxNameLength))
 		}
+		// The upstream rejects repeated points too, but numbers its fields from 0
+		// ("Field 0: ..."), so catch the common case here with the site's wording.
+		seen := map[string]bool{}
 		for _, coordinate := range field.Coordinates {
 			if len(coordinate) != 2 {
-				return e.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("Field %d: coordinates must be [latitude, longitude] pairs.", fieldIndex+1)})
+				return badRequest(fmt.Sprintf("Field %d: coordinates must be [latitude, longitude] pairs.", fieldIndex+1))
 			}
 			latitude, latErr := parseCoordinate(coordinate[0])
 			longitude, lonErr := parseCoordinate(coordinate[1])
 			if latErr != nil || lonErr != nil || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180 {
-				return e.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("Field %d: enter valid latitude and longitude values.", fieldIndex+1)})
+				return badRequest(fmt.Sprintf("Field %d: enter valid latitude and longitude values.", fieldIndex+1))
 			}
+			key := fmt.Sprintf("%.6f,%.6f", latitude, longitude)
+			if seen[key] {
+				return badRequest(fmt.Sprintf("Field %d: the three portals must be different.", fieldIndex+1))
+			}
+			seen[key] = true
 		}
 	}
 
@@ -70,23 +86,25 @@ func MuCalc(e *core.RequestEvent) error {
 	}
 	request, err := http.NewRequestWithContext(e.Request.Context(), http.MethodPost, apiBaseURL+"/getMUbulk", bytes.NewReader(body))
 	if err != nil {
-		return e.JSON(http.StatusInternalServerError, map[string]string{"error": "MU calculator API is not configured correctly."})
+		return newErrorResponse(e, err, http.StatusInternalServerError, "MU calculator API is not configured correctly.")
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(request)
 	if err != nil {
-		return e.JSON(http.StatusBadGateway, map[string]string{"error": "The MU calculator API could not be reached. Please try again."})
+		return newErrorResponse(e, err, http.StatusBadGateway, "The MU calculator API could not be reached. Please try again.")
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, muCalcMaxRequestBytes+1))
-	if err != nil || len(responseBody) > muCalcMaxRequestBytes {
-		return e.JSON(http.StatusBadGateway, map[string]string{"error": "The MU calculator API returned an invalid response."})
+	// Only ever relay JSON, and always label it as such: an upstream error page
+	// (HTML from a proxy or crash) must not be served from our origin, and the
+	// page can only show a sensible message for a JSON body.
+	if err != nil || len(responseBody) > muCalcMaxRequestBytes || !json.Valid(responseBody) {
+		if err == nil {
+			err = fmt.Errorf("upstream returned HTTP %d with a non-JSON body", response.StatusCode)
+		}
+		return newErrorResponse(e, err, http.StatusBadGateway, "The MU calculator API returned an invalid response. Please try again.")
 	}
-	contentType := response.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/json"
-	}
-	return e.Blob(response.StatusCode, contentType, responseBody)
+	return e.Blob(response.StatusCode, "application/json", responseBody)
 }
 
 func parseCoordinate(raw json.RawMessage) (float64, error) {
