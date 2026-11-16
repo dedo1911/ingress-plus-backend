@@ -3,6 +3,7 @@ package campaigns
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
@@ -60,7 +61,7 @@ func ResolveAudience(app core.App, targetingRaw string) ([]*core.Record, error) 
 				params[key] = f
 			}
 			if len(factionClauses) > 0 {
-				clauses = append(clauses, "("+joinOr(factionClauses)+")")
+				clauses = append(clauses, "("+strings.Join(factionClauses, " || ")+")")
 			}
 		case "user":
 			var userClauses []string
@@ -70,7 +71,7 @@ func ResolveAudience(app core.App, targetingRaw string) ([]*core.Record, error) 
 				params[key] = id
 			}
 			if len(userClauses) > 0 {
-				clauses = append(clauses, "("+joinOr(userClauses)+")")
+				clauses = append(clauses, "("+strings.Join(userClauses, " || ")+")")
 			}
 		}
 	}
@@ -80,7 +81,7 @@ func ResolveAudience(app core.App, targetingRaw string) ([]*core.Record, error) 
 		if len(clauses) == 0 {
 			return nil, nil // no rules configured - nobody to send to
 		}
-		filter = "(" + joinOr(clauses) + ")"
+		filter = "(" + strings.Join(clauses, " || ") + ")"
 	}
 
 	if targeting.RequireOptIn {
@@ -92,15 +93,4 @@ func ResolveAudience(app core.App, targetingRaw string) ([]*core.Record, error) 
 	}
 
 	return app.FindRecordsByFilter("users", filter, "", 0, 0, params)
-}
-
-func joinOr(clauses []string) string {
-	result := ""
-	for i, c := range clauses {
-		if i > 0 {
-			result += " || "
-		}
-		result += c
-	}
-	return result
 }
