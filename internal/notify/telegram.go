@@ -32,6 +32,7 @@ type Topics struct {
 	Badges     int64
 	BugReports int64
 	Media      int64
+	Plugins    int64
 }
 
 // Telegram posts short HTML notifications into the topics of a single
@@ -66,6 +67,7 @@ func TelegramFromEnv() *Telegram {
 			Badges:     envInt64("TELEGRAM_TOPIC_BADGES"),
 			BugReports: envInt64("TELEGRAM_TOPIC_BUG_REPORTS"),
 			Media:      envInt64("TELEGRAM_TOPIC_MEDIA"),
+			Plugins:    envInt64("TELEGRAM_TOPIC_PLUGINS"),
 		},
 	}
 }

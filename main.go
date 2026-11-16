@@ -5,6 +5,7 @@ import (
 
 	"github.com/dedo1911/ingress-plus-backend/internal/backfill"
 	"github.com/dedo1911/ingress-plus-backend/internal/campaigns"
+	"github.com/dedo1911/ingress-plus-backend/internal/iitc"
 	"github.com/dedo1911/ingress-plus-backend/internal/jobs"
 	"github.com/dedo1911/ingress-plus-backend/internal/notify"
 	"github.com/dedo1911/ingress-plus-backend/internal/players"
@@ -27,6 +28,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Same reasoning: an unkeyed fingerprint of a public user id would tell
+	// anyone holding a leaked plugin whose copy it was, and nothing to admins.
+	watermarker, err := iitc.NewWatermarkerFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Register custom routes
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
 		// v1 is the legacy endpoint that used to be served by
@@ -38,12 +46,17 @@ func main() {
 		se.Router.POST("/api/admin/campaigns/send-test", routes.SendTestCampaign).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/preview-count", routes.PreviewAudienceCount).Bind(apis.RequireSuperuserAuth())
 		se.Router.POST("/api/admin/campaigns/{id}/dispatch", routes.DispatchCampaignNow).Bind(apis.RequireSuperuserAuth())
+
+		routes.RegisterIITC(se, watermarker)
 		return se.Next()
 	})
 
 	// Block REST updates that would flip an already-sent/sending campaign
 	// back to "queued"/"draft" and cause the cron to re-send it.
 	app.OnRecordUpdateRequest("email_campaigns").BindFunc(campaigns.GuardCampaignUpdateRequest)
+
+	// IITC plugin store: REST guards on authors' edits and the review flow
+	iitc.RegisterHooks(app, telegram)
 
 	// Telegram notifications for badge and bug report changes
 	notify.RegisterHooks(app, telegram)
@@ -55,6 +68,7 @@ func main() {
 
 	// One-off data migrations, run by hand rather than on boot
 	app.RootCmd.AddCommand(backfill.NewCommand(app))
+	app.RootCmd.AddCommand(iitc.NewSetupCommand(app))
 
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
