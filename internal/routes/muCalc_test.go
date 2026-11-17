@@ -81,6 +81,47 @@ func TestMuCalcHandler(t *testing.T) {
 			},
 		},
 		{
+			Name:           "detail forwards the flag and returns cells with corners, biggest first",
+			Method:         http.MethodPost,
+			URL:            "/api/mu-calc?detail=1",
+			Body:           strings.NewReader(valid),
+			ExpectedStatus: http.StatusOK,
+			ExpectedContent: []string{
+				`"mu":120,"area_km2":3,"name":"A","cells":[{"token":"4786b1","level":10,`,
+				`"overlap_km2":2,"density":50,"mu":100,"vertices":[[`,
+				`{"token":"4786ad","level":10,`,
+			},
+			BeforeTestFunc: stub(http.StatusOK, "application/json", `{"count":1,"model":"m","results":[`+
+				`{"index":0,"ok":true,"mu":120,"area_km2":3,"cells":[`+
+				`{"s2_token":"4786ad","level":10,"overlap_km2":1,"density":20,"raw_mu":20},`+
+				`{"s2_token":"4786b1","level":10,"overlap_km2":2,"density":50,"raw_mu":100}]}]}`),
+			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+				if !strings.HasPrefix(gotBody, `{"detail":true,`) {
+					t.Errorf("upstream body = %s, want the detail flag", gotBody)
+				}
+			},
+		},
+		{
+			Name:            "without detail no cells are returned",
+			Method:          http.MethodPost,
+			URL:             "/api/mu-calc",
+			Body:            strings.NewReader(valid),
+			ExpectedStatus:  http.StatusOK,
+			ExpectedContent: []string{`[{"mu":120,"name":"A"}]`},
+			BeforeTestFunc: stub(http.StatusOK, "application/json", `{"count":1,"model":"m","results":[`+
+				`{"index":0,"ok":true,"mu":120,"cells":[{"s2_token":"4786ad","raw_mu":20}]}]}`),
+		},
+		{
+			Name:            "an invalid S2 token is not relayed",
+			Method:          http.MethodPost,
+			URL:             "/api/mu-calc?detail=true",
+			Body:            strings.NewReader(valid),
+			ExpectedStatus:  http.StatusBadGateway,
+			ExpectedContent: []string{`"error":"The MU calculator API returned an invalid response. Please try again."`},
+			BeforeTestFunc: stub(http.StatusOK, "application/json", `{"count":1,"model":"m","results":[`+
+				`{"index":0,"ok":true,"mu":120,"cells":[{"s2_token":"zz","raw_mu":20}]}]}`),
+		},
+		{
 			Name:            "a field the upstream rejects is reported 1-based",
 			Method:          http.MethodPost,
 			URL:             "/api/mu-calc",

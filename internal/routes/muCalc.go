@@ -9,18 +9,24 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golang/geo/s2"
 	"github.com/pocketbase/pocketbase/core"
 )
 
 const (
 	muCalcDefaultAPIBaseURL = "https://api.investigatexm.com"
 	muCalcMaxRequestBytes   = 64 << 10
-	muCalcMaxFields         = 50
-	muCalcMaxNameLength     = 200
+	// A detailed result lists every S2 cell a field touches, a few KB per field
+	// and far more for large ones, so the upstream answer gets its own cap.
+	muCalcMaxResponseBytes = 4 << 20
+	earthRadiusKm          = 6371.01
+	muCalcMaxFields        = 50
+	muCalcMaxNameLength    = 200
 	// The upstream gives each request 20s including queue time, then answers
 	// 504 (or "deadline exceeded" per bulk field), so wait a little longer.
 	muCalcUpstreamTimeout = 25 * time.Second
@@ -39,10 +45,20 @@ type muCalcUpstreamField struct {
 }
 
 type muCalcUpstreamResult struct {
-	OK      bool     `json:"ok"`
-	MU      *float64 `json:"mu"`
-	AreaKm2 *float64 `json:"area_km2"`
-	Error   string   `json:"error"`
+	OK      bool                 `json:"ok"`
+	MU      *float64             `json:"mu"`
+	AreaKm2 *float64             `json:"area_km2"`
+	Error   string               `json:"error"`
+	Cells   []muCalcUpstreamCell `json:"cells"`
+}
+
+// One S2 cell of a detailed result: how much of the field lies inside it and
+// what it adds (overlap times the cell's population density).
+type muCalcUpstreamCell struct {
+	Token      string  `json:"s2_token"`
+	OverlapKm2 float64 `json:"overlap_km2"`
+	Density    float64 `json:"density"`
+	RawMU      float64 `json:"raw_mu"`
 }
 
 type muCalcUpstreamResponse struct {
@@ -53,9 +69,22 @@ type muCalcUpstreamResponse struct {
 
 // muCalcResult is what the page receives per field, in request order.
 type muCalcResult struct {
-	MU      float64  `json:"mu"`
-	AreaKm2 *float64 `json:"area_km2,omitempty"`
-	Name    string   `json:"name,omitempty"`
+	MU      float64      `json:"mu"`
+	AreaKm2 *float64     `json:"area_km2,omitempty"`
+	Name    string       `json:"name,omitempty"`
+	Cells   []muCalcCell `json:"cells,omitempty"`
+}
+
+// muCalcCell is one S2 cell of a breakdown (requested with ?detail=1), with
+// its corners so a map can draw it without an S2 library of its own.
+type muCalcCell struct {
+	Token      string        `json:"token"`
+	Level      int           `json:"level"`
+	CellKm2    float64       `json:"cell_km2"`
+	OverlapKm2 float64       `json:"overlap_km2"`
+	Density    float64       `json:"density"`
+	MU         float64       `json:"mu"`
+	Vertices   [4][2]float64 `json:"vertices"`
 }
 
 // MuCalc proxies the InvestigateXM bulk MU operation (POST /getMUbulk). Keeping this
@@ -114,7 +143,13 @@ func MuCalc(e *core.RequestEvent) error {
 				strconv.FormatFloat(latitude, 'f', -1, 64)+","+strconv.FormatFloat(longitude, 'f', -1, 64))
 		}
 	}
-	upstreamBody, err := json.Marshal(map[string]any{"fields": upstreamFields})
+	detail := e.Request.URL.Query().Get("detail")
+	withDetail := detail == "1" || detail == "true"
+	upstreamRequest := map[string]any{"fields": upstreamFields}
+	if withDetail {
+		upstreamRequest["detail"] = true
+	}
+	upstreamBody, err := json.Marshal(upstreamRequest)
 	if err != nil {
 		return newErrorResponse(e, err, http.StatusInternalServerError, "Could not prepare the MU calculation.")
 	}
@@ -136,12 +171,12 @@ func MuCalc(e *core.RequestEvent) error {
 		return newErrorResponse(e, err, http.StatusBadGateway, "The MU calculator API could not be reached. Please try again.")
 	}
 	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, muCalcMaxRequestBytes+1))
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, muCalcMaxResponseBytes+1))
 	// Never relay the upstream body as is: an error page (HTML from a proxy or
 	// crash) must not be served from our origin, and the page only understands
 	// its own shapes, so everything is decoded and rebuilt here.
 	var upstream muCalcUpstreamResponse
-	if err != nil || len(responseBody) > muCalcMaxRequestBytes || json.Unmarshal(responseBody, &upstream) != nil {
+	if err != nil || len(responseBody) > muCalcMaxResponseBytes || json.Unmarshal(responseBody, &upstream) != nil {
 		if err == nil {
 			err = fmt.Errorf("upstream returned HTTP %d with a non-JSON body", response.StatusCode)
 		}
@@ -182,8 +217,43 @@ func MuCalc(e *core.RequestEvent) error {
 			return newErrorResponse(e, fmt.Errorf("field %d: missing mu", index+1), http.StatusBadGateway, "The MU calculator API returned an invalid response. Please try again.")
 		}
 		results[index] = muCalcResult{MU: *result.MU, AreaKm2: result.AreaKm2, Name: fields[index].Name}
+		if withDetail {
+			cells, err := muCalcCells(result.Cells)
+			if err != nil {
+				return newErrorResponse(e, fmt.Errorf("field %d: %w", index+1, err), http.StatusBadGateway, "The MU calculator API returned an invalid response. Please try again.")
+			}
+			results[index].Cells = cells
+		}
 	}
 	return e.JSON(http.StatusOK, results)
+}
+
+// muCalcCells turns the upstream cell list into breakdown rows, biggest share
+// first, with each cell's corners and its own area worked out from the token.
+func muCalcCells(upstream []muCalcUpstreamCell) ([]muCalcCell, error) {
+	cells := make([]muCalcCell, 0, len(upstream))
+	for _, c := range upstream {
+		id := s2.CellIDFromToken(c.Token)
+		if !id.IsValid() {
+			return nil, fmt.Errorf("invalid S2 token %q", c.Token)
+		}
+		cell := s2.CellFromCellID(id)
+		out := muCalcCell{
+			Token:      c.Token,
+			Level:      id.Level(),
+			CellKm2:    cell.ExactArea() * earthRadiusKm * earthRadiusKm,
+			OverlapKm2: c.OverlapKm2,
+			Density:    c.Density,
+			MU:         c.RawMU,
+		}
+		for k := range 4 {
+			ll := s2.LatLngFromPoint(cell.Vertex(k))
+			out.Vertices[k] = [2]float64{ll.Lat.Degrees(), ll.Lng.Degrees()}
+		}
+		cells = append(cells, out)
+	}
+	sort.SliceStable(cells, func(i, j int) bool { return cells[i].MU > cells[j].MU })
+	return cells, nil
 }
 
 func parseCoordinate(raw json.RawMessage) (float64, error) {
