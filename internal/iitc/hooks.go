@@ -34,8 +34,11 @@ func RegisterHooks(app core.App, t *notify.Telegram) {
 		if err := syncPluginWithVersion(e.App, e.Record); err != nil {
 			e.App.Logger().Error("iitc: syncing plugin after version create", "error", err, "version", e.Record.Id)
 		}
-		if e.Record.GetString("status") == VersionPending {
+		switch e.Record.GetString("status") {
+		case VersionPending:
 			t.SendAsync(e.App.Logger(), t.Topics.Plugins, Message(e.App, "IITC plugin version to review", e.Record))
+		case VersionApproved:
+			t.SendAsync(e.App.Logger(), t.Topics.Plugins, Message(e.App, "IITC plugin version published by an admin", e.Record))
 		}
 		return e.Next()
 	})
@@ -174,15 +177,21 @@ func guardVersionCreate(e *core.RecordRequestEvent) error {
 		if plugin.GetString("status") == StatusDisabled {
 			return forbidden("This plugin was disabled by the Ingress Plus team.")
 		}
-		pending, err := e.App.CountRecords(VersionsCollection, dbx.HashExp{"plugin": plugin.Id, "status": VersionPending})
-		if err != nil {
-			return err
-		}
-		if pending > 0 {
-			return badRequest("This plugin already has a version waiting for review.")
-		}
-		e.Record.Set("status", VersionPending)
 		e.Record.Set("review_notes", "")
+		if IsAdmin(e.App, e.Auth) {
+			// Admins review the store, so their own uploads skip the
+			// queue and go live straight away.
+			e.Record.Set("status", VersionApproved)
+		} else {
+			pending, err := e.App.CountRecords(VersionsCollection, dbx.HashExp{"plugin": plugin.Id, "status": VersionPending})
+			if err != nil {
+				return err
+			}
+			if pending > 0 {
+				return badRequest("This plugin already has a version waiting for review.")
+			}
+			e.Record.Set("status", VersionPending)
+		}
 	} else if e.Record.GetString("status") == "" {
 		e.Record.Set("status", VersionPending)
 	}

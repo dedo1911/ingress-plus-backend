@@ -133,6 +133,9 @@ for a slug that doesn't exist.
 3. A first pending version moves the plugin to `pending_review`. A plugin
    that's already published keeps serving its current version while an update
    is reviewed.
+   Exception: when the uploader is an admin, meaning a verified agent whose
+   email is also a superuser's, the version is created `approved` and goes
+   live straight away (it also skips the one-pending-version limit).
 4. While a version is pending, the author can already load it in their own
    IITC, so they can test it before review.
 5. A superuser sets the version to `approved` (or `rejected` with

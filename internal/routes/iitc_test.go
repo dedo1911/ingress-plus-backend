@@ -391,3 +391,45 @@ func TestIITCStoreFlow(t *testing.T) {
 		t.Fatalf("plugin still published: %s %s", p.GetString("status"), p.GetString("current_version"))
 	}
 }
+
+func TestIITCAdminUploadIsApproved(t *testing.T) {
+	h := newIITCHarness(t)
+	h.superuserToken() // root@iitc.test
+	admin, adminAuth := h.user("root", nil)
+	_, otherAuth := h.user("other", map[string]any{"verified": true})
+
+	upload := func(slug, token string) (map[string]any, *core.Record) {
+		t.Helper()
+		status, plugin := h.json(http.MethodPost, "/api/collections/iitc_plugins/records", `{"slug":"`+slug+`","name":"Test"}`, token)
+		if status != http.StatusOK {
+			t.Fatalf("create plugin: %d %v", status, plugin)
+		}
+		status, version := h.uploadVersion(plugin["id"].(string), "1.0.0", pluginCode("1.0.0"), token)
+		if status != http.StatusOK {
+			t.Fatalf("upload version: %d %v", status, version)
+		}
+		p, _ := h.app.FindRecordById(iitc.PluginsCollection, plugin["id"].(string))
+		return version, p
+	}
+
+	// The superuser's email alone isn't enough: an unverified account could
+	// belong to anyone.
+	if v, _ := upload("unverified-admin", adminAuth); v["status"] != iitc.VersionPending {
+		t.Fatalf("unverified admin email auto-approved: %v", v)
+	}
+	if v, _ := upload("regular", otherAuth); v["status"] != iitc.VersionPending {
+		t.Fatalf("regular upload not pending: %v", v)
+	}
+
+	admin.SetVerified(true)
+	if err := h.app.Save(admin); err != nil {
+		t.Fatal(err)
+	}
+	v, p := upload("admin-plugin", adminAuth)
+	if v["status"] != iitc.VersionApproved {
+		t.Fatalf("admin upload not approved: %v", v)
+	}
+	if p.GetString("status") != iitc.StatusApproved || p.GetString("current_version") != v["id"] {
+		t.Fatalf("admin plugin not published: %s %s", p.GetString("status"), p.GetString("current_version"))
+	}
+}

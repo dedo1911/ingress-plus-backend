@@ -129,6 +129,18 @@ func IsAuthor(user, plugin *core.Record) bool {
 	return user != nil && plugin != nil && plugin.GetString("author") == user.Id
 }
 
+// IsAdmin reports whether user is an Ingress Plus admin: a verified agent
+// whose email also belongs to a superuser. Superusers can't sign in with
+// Google, so this is how an admin's agent account is recognised. The email
+// has to be verified, otherwise anyone could sign up with an admin's address.
+func IsAdmin(app core.App, user *core.Record) bool {
+	if user == nil || !user.Verified() || user.Email() == "" {
+		return false
+	}
+	_, err := app.FindAuthRecordByEmail(core.CollectionNameSuperusers, user.Email())
+	return err == nil
+}
+
 // MatchesRules reports whether user is granted access by plugin's rules. The
 // author is not special-cased here, see CanAccess.
 func MatchesRules(user *core.Record, access Access) bool {
