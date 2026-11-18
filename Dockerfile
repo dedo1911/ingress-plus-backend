@@ -7,7 +7,7 @@
 # limit and the process dies with "fatal error: stack overflow".
 # Upstream fixed it in PocketBase 0.40.0 (which in turn requires Go 1.27),
 # so this pin can go once we upgrade PocketBase.
-FROM golang:1.25 AS build
+FROM golang:1.27 AS build
 WORKDIR /app
 # Modules first, so a source change doesn't invalidate the download layer.
 COPY go.mod go.sum ./
