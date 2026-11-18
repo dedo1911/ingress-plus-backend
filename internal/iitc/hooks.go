@@ -144,7 +144,7 @@ func guardPluginUpdate(e *core.RecordRequestEvent) error {
 
 // readUpload returns the content of the single file being uploaded to field.
 func readUpload(record *core.Record, field string) ([]byte, error) {
-	files := record.GetUploadedFiles(field)
+	files := record.GetUnsavedFiles(field)
 	if len(files) != 1 {
 		return nil, badRequest("Upload exactly one .js file.")
 	}
@@ -248,7 +248,7 @@ func guardVersionUpdate(e *core.RecordRequestEvent) error {
 			return badRequest(fmt.Sprintf("%q can't be changed on an uploaded version.", field))
 		}
 	}
-	if len(e.Record.GetUploadedFiles("file")) > 0 {
+	if len(e.Record.GetUnsavedFiles("file")) > 0 {
 		return badRequest("The file of an uploaded version can't be replaced.")
 	}
 	if !CanReviewVersion(original.GetString("status"), e.Record.GetString("status")) {
