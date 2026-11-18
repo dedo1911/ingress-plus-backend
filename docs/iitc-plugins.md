@@ -156,7 +156,7 @@ live immediately. Admins can disable a plugin that abuses this.
 | `GET /api/iitc/me` | IITC token | `{username, faction, verified}` |
 | `DELETE /api/iitc/tokens/current` | IITC token | revokes the token used for the call (the sideloader's Disconnect) |
 | `GET /api/iitc/plugins` | IITC token | sideloader catalog, same filtering as the store |
-| `POST /api/iitc/plugins/{slug}/load` | IITC token | `{clientPub, version?}` → `{slug, version, dev, serverPub, iv, ciphertext}` |
+| `POST /api/iitc/plugins/{slug}/load` | IITC token | `{clientPub, version?, encodings?}` → `{slug, encoding, version, dev, serverPub, iv, ciphertext}` |
 
 IITC tokens are sent as `Authorization: Bearer ipx_...`.
 
@@ -172,6 +172,22 @@ or in a proxy.
 The browser still has to decrypt the code to run it, so an agent with
 devtools open can read it. The watermark is what lets an admin trace a leaked
 copy back to its owner.
+
+### What gets encrypted
+
+The served copy isn't byte for byte the reviewed file. Before the watermark
+goes on, the code runs through esbuild to drop its comments
+(`iitc.StripComments`). The `==UserScript==` block and legal comments
+(`/*! */`, `@license`, `@preserve`) stay. esbuild reprints the code without
+minifying or renaming anything. If it can't parse a file, the original is
+served and a warning is logged. Results are cached in memory per version,
+since versions can't change after upload.
+
+Ciphertext doesn't compress, so HTTP compression does nothing for `/load`.
+When the request has `"encodings": ["gzip"]`, the server gzips the
+watermarked code before sealing it and answers `"encoding": "gzip"`. The
+sideloader inflates it with `DecompressionStream`. Without the field
+(sideloader 2.0.0 and older) the answer is `"encoding": "identity"`.
 
 ## 6. Production checklist
 

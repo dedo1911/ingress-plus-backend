@@ -1,6 +1,8 @@
 package iitc
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 
@@ -211,4 +213,40 @@ func ReadCode(app core.App, version *core.Record) ([]byte, error) {
 	defer r.Close()
 
 	return io.ReadAll(io.LimitReader(r, MaxPluginBytes+1))
+}
+
+// ServedCode is the code the sideloader gets for a version: the reviewed file
+// with its comments stripped (see StripComments). If stripping fails the
+// original file is served unchanged, since a few extra KB beat a plugin that
+// won't load.
+func ServedCode(app core.App, version *core.Record) ([]byte, error) {
+	code, err := ReadCode(app, version)
+	if err != nil {
+		return nil, err
+	}
+	stripped, err := cachedStrip(version.Id+"/"+version.GetString("file"), code)
+	if err != nil {
+		app.Logger().Warn("IITC: serving plugin with comments, stripping failed",
+			"version", version.Id, "error", err)
+		return code, nil
+	}
+	return stripped, nil
+}
+
+// Gzip compresses code for the sideloader, which inflates it with
+// DecompressionStream. It has to happen before encryption: ciphertext doesn't
+// compress, so HTTP compression can't shrink the /load response.
+func Gzip(code []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(code); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

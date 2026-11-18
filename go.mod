@@ -3,6 +3,7 @@ module github.com/dedo1911/ingress-plus-backend
 go 1.25.0
 
 require (
+	github.com/evanw/esbuild v0.28.2
 	github.com/golang/geo v0.0.0-20261106073233-5e8d6967632a
 	github.com/pocketbase/dbx v1.12.0
 	github.com/pocketbase/pocketbase v0.39.8

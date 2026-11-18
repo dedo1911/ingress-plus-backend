@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/dedo1911/ingress-plus-backend/internal/iitc"
@@ -143,6 +144,9 @@ func IITCLoadPlugin(watermarker *iitc.Watermarker) func(e *core.RequestEvent) er
 		var body struct {
 			ClientPub string `json:"clientPub"`
 			Version   string `json:"version"`
+			// Encodings lists what the sideloader can inflate. Older
+			// sideloaders don't send it and get plain code.
+			Encodings []string `json:"encodings"`
 		}
 		if err := readSmallJSON(e, &body); err != nil {
 			return newErrorResponse(e, err, http.StatusBadRequest, "Invalid request body.")
@@ -161,13 +165,21 @@ func IITCLoadPlugin(watermarker *iitc.Watermarker) func(e *core.RequestEvent) er
 			return notFound(e)
 		}
 
-		code, err := iitc.ReadCode(e.App, version)
+		code, err := iitc.ServedCode(e.App, version)
 		if err != nil {
 			return newErrorResponse(e, err, http.StatusInternalServerError, "Could not read the plugin file.")
 		}
 
-		stamped := watermarker.Apply(code, plugin.GetString("slug"), version.GetString("version"), user.Id, time.Now())
-		sealed, err := iitc.Seal(clientPub, stamped)
+		payload := watermarker.Apply(code, plugin.GetString("slug"), version.GetString("version"), user.Id, time.Now())
+		encoding := "identity"
+		if slices.Contains(body.Encodings, "gzip") {
+			if payload, err = iitc.Gzip(payload); err != nil {
+				return newErrorResponse(e, err, http.StatusInternalServerError, "Could not compress the plugin.")
+			}
+			encoding = "gzip"
+		}
+
+		sealed, err := iitc.Seal(clientPub, payload)
 		if errors.Is(err, iitc.ErrBadClientKey) {
 			return newErrorResponse(e, err, http.StatusBadRequest, err.Error())
 		}
@@ -178,6 +190,7 @@ func IITCLoadPlugin(watermarker *iitc.Watermarker) func(e *core.RequestEvent) er
 		e.Response.Header().Set("Cache-Control", "no-store")
 		return e.JSON(http.StatusOK, map[string]any{
 			"slug":       plugin.GetString("slug"),
+			"encoding":   encoding,
 			"version":    version.GetString("version"),
 			"dev":        version.Id != plugin.GetString("current_version"),
 			"serverPub":  base64.StdEncoding.EncodeToString(sealed.ServerPub),

@@ -2,6 +2,7 @@ package routes
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
@@ -139,8 +140,17 @@ func (h *iitcHarness) uploadVersion(pluginID, version, code, token string) (int,
 
 func (h *iitcHarness) load(slug, token string) (int, map[string]any, string) {
 	h.t.Helper()
+	return h.loadWith(slug, token, nil)
+}
+
+// loadWith is load with the encodings the client says it can inflate.
+func (h *iitcHarness) loadWith(slug, token string, encodings []string) (int, map[string]any, string) {
+	h.t.Helper()
 	priv, _ := ecdh.P256().GenerateKey(rand.Reader)
-	body, _ := json.Marshal(map[string]string{"clientPub": base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())})
+	body, _ := json.Marshal(map[string]any{
+		"clientPub": base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()),
+		"encodings": encodings,
+	})
 	status, out := h.json(http.MethodPost, "/api/iitc/plugins/"+slug+"/load", string(body), "Bearer "+token)
 	if status != http.StatusOK {
 		return status, out, ""
@@ -155,6 +165,15 @@ func (h *iitcHarness) load(slug, token string) (int, map[string]any, string) {
 	plain, err := iitc.Open(priv, &iitc.Sealed{ServerPub: decode("serverPub"), IV: decode("iv"), Ciphertext: decode("ciphertext")})
 	if err != nil {
 		h.t.Fatalf("decrypting payload: %v", err)
+	}
+	if out["encoding"] == "gzip" {
+		zr, err := gzip.NewReader(bytes.NewReader(plain))
+		if err != nil {
+			h.t.Fatalf("opening gzip payload: %v", err)
+		}
+		if plain, err = io.ReadAll(zr); err != nil {
+			h.t.Fatalf("inflating payload: %v", err)
+		}
 	}
 	return status, out, string(plain)
 }
@@ -281,11 +300,21 @@ func TestIITCStoreFlow(t *testing.T) {
 		t.Fatalf("author IITC catalog: %v", out)
 	}
 	status, loaded, code := h.load("test-plugin", authorToken)
-	if status != http.StatusOK || loaded["dev"] != true || !strings.Contains(code, "window.TEST_PLUGIN = '1.0.0'") {
+	if status != http.StatusOK || loaded["dev"] != true || !strings.Contains(code, "window.TEST_PLUGIN = \"1.0.0\"") {
 		t.Fatalf("author dev load: %d %v", status, loaded)
 	}
 	if !strings.Contains(code, h.wm.Fingerprint(author.Id)) {
 		t.Fatal("served code isn't watermarked")
+	}
+	if loaded["encoding"] != "identity" {
+		t.Fatalf("plain load without encodings: %v", loaded["encoding"])
+	}
+	status, loaded, code = h.loadWith("test-plugin", authorToken, []string{"gzip"})
+	if status != http.StatusOK || loaded["encoding"] != "gzip" || !strings.Contains(code, "window.TEST_PLUGIN = \"1.0.0\"") {
+		t.Fatalf("gzip load: %d %v %q", status, loaded, code)
+	}
+	if !strings.Contains(code, "// @version 1.0.0") || !strings.Contains(code, h.wm.Fingerprint(author.Id)) {
+		t.Fatalf("gzip load lost the header or the watermark: %q", code)
 	}
 	if status, _, _ := h.load("test-plugin", supporterToken); status != http.StatusNotFound {
 		t.Fatalf("unreviewed plugin served to supporter: %d", status)
