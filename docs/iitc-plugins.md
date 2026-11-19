@@ -37,7 +37,7 @@ older leaked copies from being traced, so it isn't as critical as
 | `icon` | file | max 1, 256 KB, png/jpeg/svg/webp. Public (not protected) |
 | `author` | relation → `users` | required, max 1, cascade delete |
 | `status` | select | `draft`, `pending_review`, `approved`, `rejected`, `disabled` |
-| `access` | json | `{"rules": [...]}`, see below |
+| `access` | json | `{"rules": [...], "blockedUserIds": [...]}`, see below |
 | `current_version` | relation → `iitc_plugin_versions` | max 1. The version being served |
 | `review_notes` | text | max 5000. Set by admins |
 | `created` / `updated` | autodate | |
@@ -109,8 +109,13 @@ frontend shares one editor between the two. Rules are OR'd together.
 | `verified` | `users.verification != ""` |
 | `faction` | verified agents whose `users.faction` is in `factions` (`enlightened`, `resistance`, `machina`) |
 
-The author always has access to their own plugin. With no rules, nobody else
-does.
+`access.blockedUserIds` is an optional list of user ids (max 500) that never
+get access, whatever the rules say. It lets an author open a plugin to every
+agent but a few. Blocked agents get the same 404 as everyone else without
+access.
+
+The author always has access to their own plugin, even if they put themselves
+on the blocked list. With no rules, nobody else does.
 
 Faction only counts for verified agents because users can edit their own
 faction, but not while they're verified. **Check that the `users` update rule

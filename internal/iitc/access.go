@@ -50,6 +50,7 @@ const (
 const (
 	maxRules          = 20
 	maxUsersPerRule   = 500
+	maxBlockedUsers   = 500
 	maxFactionsInRule = 3
 )
 
@@ -62,9 +63,12 @@ var validFactions = map[string]bool{
 	"machina":     true,
 }
 
-// Access is the parsed shape of a plugin's "access" JSON field.
+// Access is the parsed shape of a plugin's "access" JSON field. Rules grant
+// access; BlockedUserIds takes it away from those agents whatever the rules
+// say, so an author can open a plugin to everyone but a few.
 type Access struct {
-	Rules []campaigns.TargetRule `json:"rules"`
+	Rules          []campaigns.TargetRule `json:"rules"`
+	BlockedUserIds []string               `json:"blockedUserIds,omitempty"`
 }
 
 // ParseAccess decodes the access JSON. An empty value means no rules, which
@@ -87,6 +91,14 @@ func ValidateAccess(raw string) error {
 	access, err := ParseAccess(raw)
 	if err != nil {
 		return err
+	}
+	if len(access.BlockedUserIds) > maxBlockedUsers {
+		return fmt.Errorf("too many blocked agents (max %d)", maxBlockedUsers)
+	}
+	for _, id := range access.BlockedUserIds {
+		if id == "" {
+			return errors.New("blocked agents: empty user id")
+		}
 	}
 	if len(access.Rules) > maxRules {
 		return fmt.Errorf("too many access rules (max %d)", maxRules)
@@ -141,6 +153,19 @@ func IsAdmin(app core.App, user *core.Record) bool {
 	return err == nil
 }
 
+// IsBlocked reports whether access blocks user.
+func IsBlocked(user *core.Record, access Access) bool {
+	if user == nil {
+		return false
+	}
+	for _, id := range access.BlockedUserIds {
+		if id == user.Id {
+			return true
+		}
+	}
+	return false
+}
+
 // MatchesRules reports whether user is granted access by plugin's rules. The
 // author is not special-cased here, see CanAccess.
 func MatchesRules(user *core.Record, access Access) bool {
@@ -182,8 +207,8 @@ func MatchesRules(user *core.Record, access Access) bool {
 
 // CanAccess reports whether user may see and load plugin's published version.
 // Authors always see their own plugins; everybody else needs an approved
-// plugin with an approved version, and a matching access rule. Unparseable
-// rules fail closed.
+// plugin with an approved version, a matching access rule, and not to be on
+// its blocked list. Unparseable rules fail closed.
 //
 // This is the single gate for every route that lists or serves plugins: a user
 // who fails it must not learn the plugin exists, so callers answer 404, never
@@ -202,7 +227,7 @@ func CanAccess(user, plugin *core.Record) bool {
 	if err != nil {
 		return false
 	}
-	return MatchesRules(user, access)
+	return !IsBlocked(user, access) && MatchesRules(user, access)
 }
 
 // ErrNotFound is what every lookup returns when the plugin doesn't exist or

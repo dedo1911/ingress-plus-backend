@@ -45,6 +45,8 @@ func TestValidateAccess(t *testing.T) {
 		{`{"rules":[{"type":"user","userIds":[]}]}`, false},
 		{`{"rules":[{"type":"everyone"}]}`, false},
 		{`not json`, false},
+		{`{"rules":[{"type":"all"}],"blockedUserIds":["abc"]}`, true},
+		{`{"rules":[],"blockedUserIds":[""]}`, false},
 	}
 	for _, c := range cases {
 		if err := ValidateAccess(c.raw); (err == nil) != c.ok {
@@ -85,6 +87,10 @@ func TestCanAccess(t *testing.T) {
 		{"user rule, listed", plain, testPlugin("a", StatusApproved, "v", `{"rules":[{"type":"user","userIds":["zz","u1"]}]}`), true},
 		{"user rule, not listed", plain, testPlugin("a", StatusApproved, "v", `{"rules":[{"type":"user","userIds":["zz"]}]}`), false},
 		{"rules are OR'd", plain, testPlugin("a", StatusApproved, "v", `{"rules":[{"type":"supporter"},{"type":"user","userIds":["u1"]}]}`), true},
+		{"blocked beats the all rule", plain, testPlugin("a", StatusApproved, "v", `{"rules":[{"type":"all"}],"blockedUserIds":["u1"]}`), false},
+		{"blocked beats the user rule", plain, testPlugin("a", StatusApproved, "v", `{"rules":[{"type":"user","userIds":["u1"]}],"blockedUserIds":["u1"]}`), false},
+		{"others still get in", supporter, testPlugin("a", StatusApproved, "v", `{"rules":[{"type":"all"}],"blockedUserIds":["u1"]}`), true},
+		{"author can't block themselves", plain, testPlugin("u1", StatusApproved, "v", `{"rules":[],"blockedUserIds":["u1"]}`), true},
 		{"broken JSON fails closed", plain, testPlugin("a", StatusApproved, "v", `{"rules":`), false},
 	}
 	for _, c := range cases {
