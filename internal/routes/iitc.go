@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -32,6 +33,7 @@ func RegisterIITC(se *core.ServeEvent, watermarker *iitc.Watermarker) {
 	group.GET("/plugins", IITCListPlugins)
 	group.GET("/plugins/{slug}", IITCPluginDetail)
 	group.POST("/plugins/{slug}/load", IITCLoadPlugin(watermarker))
+	group.POST("/boot", IITCBoot(watermarker))
 }
 
 func notFound(e *core.RequestEvent) error {
@@ -39,8 +41,12 @@ func notFound(e *core.RequestEvent) error {
 }
 
 func readSmallJSON(e *core.RequestEvent, dst any) error {
-	body, err := io.ReadAll(io.LimitReader(e.Request.Body, iitcMaxBodyBytes+1))
-	if err != nil || len(body) > iitcMaxBodyBytes {
+	return readJSON(e, dst, iitcMaxBodyBytes)
+}
+
+func readJSON(e *core.RequestEvent, dst any, limit int64) error {
+	body, err := io.ReadAll(io.LimitReader(e.Request.Body, limit+1))
+	if err != nil || int64(len(body)) > limit {
 		return errors.New("request body too large or unreadable")
 	}
 	if len(body) == 0 {
@@ -147,13 +153,69 @@ func IITCPluginDetail(e *core.RequestEvent) error {
 	return pluginDetail(e, iitc.TokenUser(e))
 }
 
+// sealPlugin is the code of one plugin version, watermarked for user and
+// encrypted to clientPub, as the sideloader gets it from /load and /boot.
+// It returns iitc.ErrNotFound when the plugin doesn't exist or user can't
+// access it, and iitc.ErrBadClientKey for a key that isn't a P-256 point.
+// dev asks for the author's version still waiting for review; for anyone
+// else, or when there's none, it's ignored.
+func sealPlugin(app core.App, watermarker *iitc.Watermarker, user *core.Record, slug, requested string, dev bool, clientPub []byte, gzip bool) (map[string]any, error) {
+	plugin, err := iitc.FindAccessible(app, user, slug)
+	if err != nil {
+		return nil, iitc.ErrNotFound
+	}
+	var version *core.Record
+	if dev && requested == "" && iitc.IsAuthor(user, plugin) {
+		version = iitc.PendingVersion(app, plugin)
+	}
+	if version == nil {
+		if version, err = iitc.ResolveVersion(app, plugin, user, requested); err != nil {
+			return nil, iitc.ErrNotFound
+		}
+	}
+
+	code, err := iitc.ServedCode(app, version)
+	if err != nil {
+		return nil, fmt.Errorf("reading the plugin file: %w", err)
+	}
+
+	payload := watermarker.Apply(code, plugin.GetString("slug"), version.GetString("version"), user.Id, time.Now())
+	encoding := "identity"
+	if gzip {
+		if payload, err = iitc.Gzip(payload); err != nil {
+			return nil, fmt.Errorf("compressing the plugin: %w", err)
+		}
+		encoding = "gzip"
+	}
+
+	sealed, err := iitc.Seal(clientPub, payload)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"slug":       plugin.GetString("slug"),
+		"encoding":   encoding,
+		"version":    version.GetString("version"),
+		"dev":        version.Id != plugin.GetString("current_version"),
+		"serverPub":  base64.StdEncoding.EncodeToString(sealed.ServerPub),
+		"iv":         base64.StdEncoding.EncodeToString(sealed.IV),
+		"ciphertext": base64.StdEncoding.EncodeToString(sealed.Ciphertext),
+	}, nil
+}
+
+func decodeClientPub(raw string) ([]byte, error) {
+	clientPub, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(clientPub) == 0 {
+		return nil, errors.New("bad clientPub")
+	}
+	return clientPub, nil
+}
+
 // IITCLoadPlugin serves one plugin's code to the sideloader, watermarked for
 // the requesting agent and encrypted to the key pair the sideloader just
 // generated (see iitc.Seal for what that does and doesn't protect against).
 func IITCLoadPlugin(watermarker *iitc.Watermarker) func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		user := iitc.TokenUser(e)
-
 		var body struct {
 			ClientPub string `json:"clientPub"`
 			Version   string `json:"version"`
@@ -164,51 +226,91 @@ func IITCLoadPlugin(watermarker *iitc.Watermarker) func(e *core.RequestEvent) er
 		if err := readSmallJSON(e, &body); err != nil {
 			return newErrorResponse(e, err, http.StatusBadRequest, "Invalid request body.")
 		}
-		clientPub, err := base64.StdEncoding.DecodeString(body.ClientPub)
-		if err != nil || len(clientPub) == 0 {
-			return newErrorResponse(e, errors.New("bad clientPub"), http.StatusBadRequest, "clientPub must be a base64 raw P-256 public key.")
+		clientPub, err := decodeClientPub(body.ClientPub)
+		if err != nil {
+			return newErrorResponse(e, err, http.StatusBadRequest, "clientPub must be a base64 raw P-256 public key.")
 		}
 
-		plugin, err := iitc.FindAccessible(e.App, user, e.Request.PathValue("slug"))
-		if err != nil {
+		out, err := sealPlugin(e.App, watermarker, iitc.TokenUser(e), e.Request.PathValue("slug"), body.Version, false,
+			clientPub, slices.Contains(body.Encodings, "gzip"))
+		switch {
+		case errors.Is(err, iitc.ErrNotFound):
 			return notFound(e)
-		}
-		version, err := iitc.ResolveVersion(e.App, plugin, user, body.Version)
-		if err != nil {
-			return notFound(e)
-		}
-
-		code, err := iitc.ServedCode(e.App, version)
-		if err != nil {
-			return newErrorResponse(e, err, http.StatusInternalServerError, "Could not read the plugin file.")
-		}
-
-		payload := watermarker.Apply(code, plugin.GetString("slug"), version.GetString("version"), user.Id, time.Now())
-		encoding := "identity"
-		if slices.Contains(body.Encodings, "gzip") {
-			if payload, err = iitc.Gzip(payload); err != nil {
-				return newErrorResponse(e, err, http.StatusInternalServerError, "Could not compress the plugin.")
-			}
-			encoding = "gzip"
-		}
-
-		sealed, err := iitc.Seal(clientPub, payload)
-		if errors.Is(err, iitc.ErrBadClientKey) {
+		case errors.Is(err, iitc.ErrBadClientKey):
 			return newErrorResponse(e, err, http.StatusBadRequest, err.Error())
-		}
-		if err != nil {
-			return newErrorResponse(e, err, http.StatusInternalServerError, "Could not encrypt the plugin.")
+		case err != nil:
+			return newErrorResponse(e, err, http.StatusInternalServerError, "Could not load the plugin.")
 		}
 
 		e.Response.Header().Set("Cache-Control", "no-store")
-		return e.JSON(http.StatusOK, map[string]any{
-			"slug":       plugin.GetString("slug"),
-			"encoding":   encoding,
-			"version":    version.GetString("version"),
-			"dev":        version.Id != plugin.GetString("current_version"),
-			"serverPub":  base64.StdEncoding.EncodeToString(sealed.ServerPub),
-			"iv":         base64.StdEncoding.EncodeToString(sealed.IV),
-			"ciphertext": base64.StdEncoding.EncodeToString(sealed.Ciphertext),
-		})
+		return e.JSON(http.StatusOK, out)
+	}
+}
+
+const (
+	iitcBootMaxBodyBytes = 16 << 10
+	iitcBootMaxPlugins   = 50
+)
+
+// IITCBoot is the sideloader's startup call: the catalog and the code of
+// every plugin it wants to load, in one round trip instead of the catalog
+// first and then one /load per plugin.
+//
+// loads follows the order of the request. A plugin that doesn't exist or
+// that the agent can't access gets {"slug", "error": "Plugin not found."},
+// the same answer for both cases, as on /load. The other plugins still
+// load.
+func IITCBoot(watermarker *iitc.Watermarker) func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		var body struct {
+			ClientPub string   `json:"clientPub"`
+			Encodings []string `json:"encodings"`
+			Plugins   []struct {
+				Slug string `json:"slug"`
+				// Dev asks for the author's version waiting for review.
+				Dev bool `json:"dev"`
+			} `json:"plugins"`
+		}
+		if err := readJSON(e, &body, iitcBootMaxBodyBytes); err != nil {
+			return newErrorResponse(e, err, http.StatusBadRequest, "Invalid request body.")
+		}
+		if len(body.Plugins) > iitcBootMaxPlugins {
+			return newErrorResponse(e, errors.New("too many plugins"), http.StatusBadRequest,
+				fmt.Sprintf("Ask for at most %d plugins at once.", iitcBootMaxPlugins))
+		}
+		clientPub, err := decodeClientPub(body.ClientPub)
+		if err != nil && len(body.Plugins) > 0 {
+			return newErrorResponse(e, err, http.StatusBadRequest, "clientPub must be a base64 raw P-256 public key.")
+		}
+
+		user := iitc.TokenUser(e)
+		catalog, err := iitc.ListAccessible(e.App, user)
+		if err != nil {
+			return newErrorResponse(e, err, http.StatusInternalServerError, "Could not list plugins.")
+		}
+
+		gzip := slices.Contains(body.Encodings, "gzip")
+		loads := make([]map[string]any, 0, len(body.Plugins))
+		seen := map[string]bool{}
+		for _, want := range body.Plugins {
+			if seen[want.Slug] {
+				continue
+			}
+			seen[want.Slug] = true
+			out, err := sealPlugin(e.App, watermarker, user, want.Slug, "", want.Dev, clientPub, gzip)
+			switch {
+			case errors.Is(err, iitc.ErrNotFound):
+				out = map[string]any{"slug": want.Slug, "error": "Plugin not found."}
+			case errors.Is(err, iitc.ErrBadClientKey):
+				return newErrorResponse(e, err, http.StatusBadRequest, err.Error())
+			case err != nil:
+				e.App.Logger().Error("iitc boot: loading plugin", "slug", want.Slug, "error", err)
+				out = map[string]any{"slug": want.Slug, "error": "Could not load the plugin."}
+			}
+			loads = append(loads, out)
+		}
+
+		e.Response.Header().Set("Cache-Control", "no-store")
+		return e.JSON(http.StatusOK, map[string]any{"plugins": catalog, "loads": loads})
 	}
 }

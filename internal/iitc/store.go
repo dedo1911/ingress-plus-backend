@@ -81,9 +81,8 @@ func summarize(app core.App, plugin, user *core.Record) PluginSummary {
 		if access, err := ParseAccess(plugin.GetString("access")); err == nil {
 			s.Access = &access
 		}
-		if pending, err := app.FindRecordsByFilter(VersionsCollection, "plugin = {:p} && status = {:s}", "-created", 1, 0,
-			dbx.Params{"p": plugin.Id, "s": VersionPending}); err == nil && len(pending) > 0 {
-			s.DevVersion = pending[0].GetString("version")
+		if pending := PendingVersion(app, plugin); pending != nil {
+			s.DevVersion = pending.GetString("version")
 		}
 	}
 	return s
@@ -164,6 +163,17 @@ func Detail(app core.App, plugin, user *core.Record) (PluginDetail, error) {
 	return d, nil
 }
 
+// PendingVersion returns plugin's newest version still waiting for review, or
+// nil. Only its author may load it (see ResolveVersion).
+func PendingVersion(app core.App, plugin *core.Record) *core.Record {
+	pending, err := app.FindRecordsByFilter(VersionsCollection, "plugin = {:p} && status = {:s}", "-created", 1, 0,
+		dbx.Params{"p": plugin.Id, "s": VersionPending})
+	if err != nil || len(pending) == 0 {
+		return nil
+	}
+	return pending[0]
+}
+
 // ResolveVersion picks the version record to serve. Without an explicit
 // version that's the published one, falling back for the author alone to
 // their newest pending upload so they can try it before review. An explicit
@@ -183,12 +193,10 @@ func ResolveVersion(app core.App, plugin, user *core.Record, requested string) (
 		if !author {
 			return nil, ErrNotFound
 		}
-		pending, err := app.FindRecordsByFilter(VersionsCollection, "plugin = {:p} && status = {:s}", "-created", 1, 0,
-			dbx.Params{"p": plugin.Id, "s": VersionPending})
-		if err != nil || len(pending) == 0 {
-			return nil, ErrNotFound
+		if pending := PendingVersion(app, plugin); pending != nil {
+			return pending, nil
 		}
-		return pending[0], nil
+		return nil, ErrNotFound
 	}
 
 	version, err := app.FindFirstRecordByFilter(VersionsCollection, "plugin = {:p} && version = {:v}",

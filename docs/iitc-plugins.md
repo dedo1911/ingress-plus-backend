@@ -166,6 +166,7 @@ live immediately. Admins can disable a plugin that abuses this.
 | `GET /api/iitc/plugins` | IITC token | sideloader catalog, same filtering as the store |
 | `GET /api/iitc/plugins/{slug}` | IITC token | same payload as `/api/plugins/{slug}`, for the changelog in the IITC store; 404 without access |
 | `POST /api/iitc/plugins/{slug}/load` | IITC token | `{clientPub, version?, encodings?}` → `{slug, encoding, version, dev, serverPub, iv, ciphertext}` |
+| `POST /api/iitc/boot` | IITC token | sideloader startup: `{clientPub, encodings?, plugins: [{slug, dev?}]}` (max 50) → `{plugins, loads}`, the catalog plus one `/load` answer per plugin in request order, or `{slug, error}` for one the agent can't load. `dev` asks for the author's pending version. Saves the catalog round trip before the loads |
 
 IITC tokens are sent as `Authorization: Bearer ipx_...`.
 

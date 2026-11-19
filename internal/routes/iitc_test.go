@@ -155,6 +155,12 @@ func (h *iitcHarness) loadWith(slug, token string, encodings []string) (int, map
 	if status != http.StatusOK {
 		return status, out, ""
 	}
+	return status, out, h.openSealed(priv, out)
+}
+
+// openSealed decrypts and inflates one /load or /boot payload.
+func (h *iitcHarness) openSealed(priv *ecdh.PrivateKey, out map[string]any) string {
+	h.t.Helper()
 	decode := func(k string) []byte {
 		b, err := base64.StdEncoding.DecodeString(out[k].(string))
 		if err != nil {
@@ -175,7 +181,7 @@ func (h *iitcHarness) loadWith(slug, token string, encodings []string) (int, map
 			h.t.Fatalf("inflating payload: %v", err)
 		}
 	}
-	return status, out, string(plain)
+	return string(plain)
 }
 
 func (h *iitcHarness) mintToken(authToken string) string {
@@ -442,5 +448,106 @@ func TestIITCAdminUploadIsApproved(t *testing.T) {
 	}
 	if p.GetString("status") != iitc.StatusApproved || p.GetString("current_version") != v["id"] {
 		t.Fatalf("admin plugin not published: %s %s", p.GetString("status"), p.GetString("current_version"))
+	}
+}
+
+// publish creates a plugin as authorAuth, uploads version 1.0.0 and has it
+// approved, so it's live for whoever its access rules let in.
+func (h *iitcHarness) publish(slug, access, authorAuth, root string) string {
+	h.t.Helper()
+	status, plugin := h.json(http.MethodPost, "/api/collections/iitc_plugins/records",
+		`{"slug":"`+slug+`","name":"`+slug+`","access":`+access+`}`, authorAuth)
+	if status != http.StatusOK {
+		h.t.Fatalf("create %s: %d %v", slug, status, plugin)
+	}
+	status, version := h.uploadVersion(plugin["id"].(string), "1.0.0", pluginCode("1.0.0"), authorAuth)
+	if status != http.StatusOK {
+		h.t.Fatalf("upload %s: %d %v", slug, status, version)
+	}
+	if status, out := h.json(http.MethodPatch, "/api/collections/iitc_plugin_versions/records/"+version["id"].(string), `{"status":"approved"}`, root); status != http.StatusOK {
+		h.t.Fatalf("approve %s: %d %v", slug, status, out)
+	}
+	return plugin["id"].(string)
+}
+
+func TestIITCBoot(t *testing.T) {
+	h := newIITCHarness(t)
+	author, authorAuth := h.user("author", nil)
+	agent, agentAuth := h.user("agent", nil)
+	root := h.superuserToken()
+
+	h.publish("open-plugin", `{"rules":[{"type":"all"}]}`, authorAuth, root)
+	h.publish("blocked-plugin", `{"rules":[{"type":"all"}],"blockedUserIds":["`+agent.Id+`"]}`, authorAuth, root)
+	devID := h.publish("dev-plugin", `{"rules":[{"type":"all"}]}`, authorAuth, root)
+	if status, out := h.uploadVersion(devID, "1.1.0", pluginCode("1.1.0"), authorAuth); status != http.StatusOK {
+		t.Fatalf("upload dev version: %d %v", status, out)
+	}
+
+	authorToken := h.mintToken(authorAuth)
+	agentToken := h.mintToken(agentAuth)
+
+	boot := func(token string, plugins string) (int, map[string]any, *ecdh.PrivateKey) {
+		priv, _ := ecdh.P256().GenerateKey(rand.Reader)
+		body := `{"clientPub":"` + base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()) + `","encodings":["gzip"],"plugins":` + plugins + `}`
+		status, out := h.json(http.MethodPost, "/api/iitc/boot", body, "Bearer "+token)
+		return status, out, priv
+	}
+	loads := func(out map[string]any) []map[string]any {
+		var l []map[string]any
+		for _, x := range out["loads"].([]any) {
+			l = append(l, x.(map[string]any))
+		}
+		return l
+	}
+
+	// The agent gets the catalog without the blocked plugin, and its load
+	// fails like one that doesn't exist; the others still load, in order.
+	status, out, priv := boot(agentToken, `[{"slug":"dev-plugin","dev":true},{"slug":"blocked-plugin"},{"slug":"open-plugin"},{"slug":"nope"},{"slug":"open-plugin"}]`)
+	if status != http.StatusOK {
+		t.Fatalf("boot: %d %v", status, out)
+	}
+	if got := slugs(out); strings.Join(got, ",") != "dev-plugin,open-plugin" {
+		t.Fatalf("agent catalog: %v", got)
+	}
+	l := loads(out)
+	if len(l) != 4 {
+		t.Fatalf("loads: %v", l)
+	}
+	if l[0]["slug"] != "dev-plugin" || l[0]["version"] != "1.0.0" || l[0]["dev"] != false {
+		t.Fatalf("dev flag served a pending version to a non-author: %v", l[0])
+	}
+	if code := h.openSealed(priv, l[0]); !strings.Contains(code, h.wm.Fingerprint(agent.Id)) || !strings.Contains(code, `"1.0.0"`) {
+		t.Fatalf("boot payload: %q", code)
+	}
+	if l[1]["slug"] != "blocked-plugin" || l[1]["error"] != "Plugin not found." || l[1]["ciphertext"] != nil {
+		t.Fatalf("blocked plugin: %v", l[1])
+	}
+	if l[2]["slug"] != "open-plugin" || l[2]["ciphertext"] == nil {
+		t.Fatalf("open plugin: %v", l[2])
+	}
+	h.openSealed(priv, l[2])
+	if l[3]["slug"] != "nope" || l[3]["error"] != "Plugin not found." {
+		t.Fatalf("missing plugin: %v", l[3])
+	}
+
+	// The author can ask for their pending version.
+	status, out, priv = boot(authorToken, `[{"slug":"dev-plugin","dev":true},{"slug":"blocked-plugin"}]`)
+	l = loads(out)
+	if status != http.StatusOK || l[0]["version"] != "1.1.0" || l[0]["dev"] != true || l[1]["ciphertext"] == nil {
+		t.Fatalf("author boot: %d %v", status, out)
+	}
+	if code := h.openSealed(priv, l[0]); !strings.Contains(code, h.wm.Fingerprint(author.Id)) || !strings.Contains(code, `"1.1.0"`) {
+		t.Fatalf("author dev payload: %q", code)
+	}
+
+	// No plugins: just the catalog, no key needed.
+	if status, out := h.json(http.MethodPost, "/api/iitc/boot", `{"plugins":[]}`, "Bearer "+agentToken); status != http.StatusOK || len(slugs(out)) != 2 {
+		t.Fatalf("empty boot: %d %v", status, out)
+	}
+	if status, _, _ := boot(agentToken, "["+strings.Repeat(`{"slug":"x"},`, 50)+`{"slug":"x"}]`); status != http.StatusBadRequest {
+		t.Fatalf("51 plugins accepted: %d", status)
+	}
+	if status, _ := h.json(http.MethodPost, "/api/iitc/boot", `{"plugins":[]}`, ""); status != http.StatusUnauthorized {
+		t.Fatalf("boot without a token: %d", status)
 	}
 }
