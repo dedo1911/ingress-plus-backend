@@ -174,6 +174,10 @@ func ResolveVersion(app core.App, plugin, user *core.Record, requested string) (
 
 	if requested == "" {
 		if current != "" {
+			// FindAccessible already expanded it.
+			if v := plugin.ExpandedOne("current_version"); v != nil && v.Id == current {
+				return v, nil
+			}
 			return app.FindRecordById(VersionsCollection, current)
 		}
 		if !author {
@@ -218,27 +222,36 @@ func ReadCode(app core.App, version *core.Record) ([]byte, error) {
 // ServedCode is the code the sideloader gets for a version: the reviewed file
 // with its comments stripped (see StripComments). If stripping fails the
 // original file is served unchanged, since a few extra KB beat a plugin that
-// won't load.
+// won't load. The result is kept in memory, so a version's file is read and
+// stripped once, not on every load.
 func ServedCode(app core.App, version *core.Record) ([]byte, error) {
+	key := version.Id + "/" + version.GetString("file")
+	if code, ok := cachedServed(key); ok {
+		return code, nil
+	}
 	code, err := ReadCode(app, version)
 	if err != nil {
 		return nil, err
 	}
-	stripped, err := cachedStrip(version.Id+"/"+version.GetString("file"), code)
-	if err != nil {
+	if stripped, err := StripComments(code); err == nil {
+		code = stripped
+	} else {
 		app.Logger().Warn("IITC: serving plugin with comments, stripping failed",
 			"version", version.Id, "error", err)
-		return code, nil
 	}
-	return stripped, nil
+	cacheServed(key, code)
+	return code, nil
 }
 
 // Gzip compresses code for the sideloader, which inflates it with
 // DecompressionStream. It has to happen before encryption: ciphertext doesn't
-// compress, so HTTP compression can't shrink the /load response.
+// compress, so HTTP compression can't shrink the /load response. It runs on
+// every load (the watermark makes each copy different), so it uses the
+// default level: BestCompression costs about half as much time again for
+// around 1% smaller output.
 func Gzip(code []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	zw, err := gzip.NewWriterLevel(&buf, gzip.DefaultCompression)
 	if err != nil {
 		return nil, err
 	}

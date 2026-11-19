@@ -77,34 +77,28 @@ func userscriptHeader(code []byte) []byte {
 	return nil
 }
 
-// strippedCache holds StripComments output per version. Versions can't be
-// changed once uploaded (see guardVersionUpdate), so an entry never goes
-// stale; the cap only bounds memory.
-var strippedCache = struct {
+// servedCache holds the code served for each version (see ServedCode).
+// Versions can't be changed once uploaded (see guardVersionUpdate), so an
+// entry never goes stale; the cap only bounds memory.
+var servedCache = struct {
 	sync.Mutex
 	entries map[string][]byte
 }{entries: map[string][]byte{}}
 
-const strippedCacheMax = 64
+const servedCacheMax = 64
 
-func cachedStrip(key string, code []byte) ([]byte, error) {
-	strippedCache.Lock()
-	hit, ok := strippedCache.entries[key]
-	strippedCache.Unlock()
-	if ok {
-		return hit, nil
-	}
+func cachedServed(key string) ([]byte, bool) {
+	servedCache.Lock()
+	defer servedCache.Unlock()
+	code, ok := servedCache.entries[key]
+	return code, ok
+}
 
-	stripped, err := StripComments(code)
-	if err != nil {
-		return nil, err
+func cacheServed(key string, code []byte) {
+	servedCache.Lock()
+	defer servedCache.Unlock()
+	if len(servedCache.entries) >= servedCacheMax {
+		clear(servedCache.entries)
 	}
-
-	strippedCache.Lock()
-	if len(strippedCache.entries) >= strippedCacheMax {
-		clear(strippedCache.entries)
-	}
-	strippedCache.entries[key] = stripped
-	strippedCache.Unlock()
-	return stripped, nil
+	servedCache.entries[key] = code
 }
