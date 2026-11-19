@@ -30,6 +30,7 @@ func RegisterIITC(se *core.ServeEvent, watermarker *iitc.Watermarker) {
 	group.GET("/me", IITCMe)
 	group.DELETE("/tokens/current", RevokeCurrentIITCToken)
 	group.GET("/plugins", IITCListPlugins)
+	group.GET("/plugins/{slug}", IITCPluginDetail)
 	group.POST("/plugins/{slug}/load", IITCLoadPlugin(watermarker))
 }
 
@@ -119,19 +120,31 @@ func StoreListPlugins(e *core.RequestEvent) error {
 	return listPlugins(e, e.Auth)
 }
 
-// StorePluginDetail is the store detail page. A plugin the user can't access
-// is a 404, the same as one that doesn't exist.
-func StorePluginDetail(e *core.RequestEvent) error {
-	plugin, err := iitc.FindAccessible(e.App, e.Auth, e.Request.PathValue("slug"))
+// pluginDetail is shared by the store detail page and the sideloader's
+// changelog. A plugin the user can't access is a 404, the same as one that
+// doesn't exist.
+func pluginDetail(e *core.RequestEvent, user *core.Record) error {
+	plugin, err := iitc.FindAccessible(e.App, user, e.Request.PathValue("slug"))
 	if err != nil {
 		return notFound(e)
 	}
-	detail, err := iitc.Detail(e.App, plugin, e.Auth)
+	detail, err := iitc.Detail(e.App, plugin, user)
 	if err != nil {
 		return newErrorResponse(e, err, http.StatusInternalServerError, "Could not load the plugin.")
 	}
 	e.Response.Header().Set("Cache-Control", "private, no-store")
 	return e.JSON(http.StatusOK, detail)
+}
+
+// StorePluginDetail is the store detail page (PocketBase user auth).
+func StorePluginDetail(e *core.RequestEvent) error {
+	return pluginDetail(e, e.Auth)
+}
+
+// IITCPluginDetail gives the IITC store the version history, for the
+// changelog dialog and the "what's new" popup after an update.
+func IITCPluginDetail(e *core.RequestEvent) error {
+	return pluginDetail(e, iitc.TokenUser(e))
 }
 
 // IITCLoadPlugin serves one plugin's code to the sideloader, watermarked for

@@ -159,6 +159,7 @@ live immediately. Admins can disable a plugin that abuses this.
 | `GET /api/iitc/me` | IITC token | `{username, faction, verified}` |
 | `DELETE /api/iitc/tokens/current` | IITC token | revokes the token used for the call (the sideloader's Disconnect) |
 | `GET /api/iitc/plugins` | IITC token | sideloader catalog, same filtering as the store |
+| `GET /api/iitc/plugins/{slug}` | IITC token | same payload as `/api/plugins/{slug}`, for the changelog in the IITC store; 404 without access |
 | `POST /api/iitc/plugins/{slug}/load` | IITC token | `{clientPub, version?, encodings?}` → `{slug, encoding, version, dev, serverPub, iv, ciphertext}` |
 
 IITC tokens are sent as `Authorization: Bearer ipx_...`.

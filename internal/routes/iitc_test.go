@@ -354,6 +354,17 @@ func TestIITCStoreFlow(t *testing.T) {
 		t.Fatal("access rules shown to a non-author")
 	}
 
+	status, detail = h.json(http.MethodGet, "/api/iitc/plugins/test-plugin", "", "Bearer "+supporterToken)
+	if status != http.StatusOK {
+		t.Fatalf("supporter IITC detail: %d %v", status, detail)
+	}
+	if versions := detail["versions"].([]any); len(versions) != 1 || versions[0].(map[string]any)["version"] != "1.0.0" {
+		t.Fatalf("supporter IITC versions: %v", detail["versions"])
+	}
+	if status, _ := h.json(http.MethodGet, "/api/iitc/plugins/test-plugin", "", "Bearer "+otherToken); status != http.StatusNotFound {
+		t.Fatalf("IITC detail for a user without access: %d", status)
+	}
+
 	status, loaded, code = h.load("test-plugin", supporterToken)
 	if status != http.StatusOK || loaded["dev"] != false || !strings.Contains(code, h.wm.Fingerprint(supporter.Id)) {
 		t.Fatalf("supporter load: %d %v", status, loaded)
